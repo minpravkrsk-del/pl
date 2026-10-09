@@ -1,0 +1,45 @@
+name: auto
+
+on:
+  schedule:
+    - cron: "0 3 * * 4"     # Чт 03:00 UTC
+    - cron: "0 10 * * 4"    # Чт 10:00 UTC
+    - cron: "30 2 * * 5"    # Пт 02:30 UTC
+    - cron: "0 3 * * 5"     # Пт 03:00 UTC
+    - cron: "50 3 * * 5"    # Пт 03:50 UTC
+    - cron: "30 4 * * 5"    # Пт 04:30 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "prep | fill | sync"
+        required: false
+        default: "sync"
+
+jobs:
+  auto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install python-docx
+      - name: Run
+        env:
+          YADISK_TOKEN: ${{ secrets.YADISK_TOKEN }}
+          CAL_TOKEN: ${{ secrets.CAL_TOKEN }}
+          FORM_URL: ${{ secrets.FORM_URL }}
+          FORM_NAME: ${{ secrets.FORM_NAME }}
+          FORM_PATH: ${{ secrets.FORM_PATH }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
+          SECTIONS: ${{ secrets.SECTIONS }}
+          GOVERNORS: ${{ secrets.GOVERNORS }}
+          YC_API_KEY: ${{ secrets.YC_API_KEY }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          if [ -n "${{ inputs.mode }}" ]; then
+            python scripts/run.py ${{ inputs.mode }}
+          else
+            python scripts/run.py
+          fi
