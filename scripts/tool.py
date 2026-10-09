@@ -115,6 +115,7 @@ NATPROJ = [
 GOVPROGRAMS = ['Спорт России']
 
 GOVERNORS = [g.strip().lower() for g in os.environ.get("GOVERNORS", "").split(",") if g.strip()]
+GOV_MARKER = os.environ.get("GOV_MARKER", "").strip()
 
 
 # --------------------------------------------------------------- календарь ---
@@ -410,9 +411,14 @@ def polish_text(text):
 
 
 def write_event(cell, ev):
-    """Записать мероприятие в ячейку: нацпроект(ы) жирным, пустая строка,
-    ОРГАН: заголовок, пустая строка, описание, пустая строка, форматы."""
+    """Записать мероприятие в ячейку: пометка участием и нацпроект(ы) жирным,
+    пустая строка, ОРГАН: заголовок, пустая строка, описание, пустая строка, форматы."""
     clear_cell(cell)
+    if ev.get('gov_marker') and GOV_MARKER:
+        p = cell.add_paragraph()
+        r = p.add_run(GOV_MARKER)
+        set_run(r, 10, bold=True)
+        cell.add_paragraph()
     if ev.get('nats'):
         for n in ev['nats']:
             p = cell.add_paragraph()
@@ -465,7 +471,8 @@ def collect_week_events(monday):
             continue
         canon, rest = canon_org(ev['title'])
         text_all = ev['title'] + '\n' + ev['desc']
-        if is_governor(text_all):
+        gov_hit = is_governor(text_all)
+        if gov_hit and canon not in ORDER:
             skipped_gov.append({'start': start, 'title': ev['title'], 'desc': ev['desc']})
             continue
         week.append({
@@ -476,6 +483,7 @@ def collect_week_events(monday):
             'start': start.strftime('%Y-%m-%d %H:%M'),
             'formats': normalize_formats(ev['desc']),
             'nats': find_natproj(text_all),
+            'gov_marker': bool(gov_hit and GOV_MARKER),
         })
     # дедупликация одинаковых
     seen = set()
@@ -602,7 +610,7 @@ def cmd_fill(args):
             write_event(cell, ev)
             snapshot.append({
                 'day': d, 'canon': ev['canon'], 'title': ev['title'],
-                'start': ev['start'],
+                'start': ev['start'], 'gov_marker': ev.get('gov_marker', False),
                 'sig': None,  # пересчитается после LLM-полировки
             })
 
@@ -629,6 +637,11 @@ def cmd_fill(args):
     unknown = sorted({e['canon'] for e in events if e['canon'] not in ORDER})
     if unknown:
         print(f"[fill] НЕРАСПОЗНАННЫЕ ОРГАНЫ (проверить): {unknown}")
+    marked = [e for e in events if e.get('gov_marker')]
+    if marked:
+        print("[fill] Помечено участием (проверьте):")
+        for e in marked:
+            print(f"    {(monday + timedelta(days=e['day'])).strftime('%d.%m')} {e['canon']}: {e['title'][:70]}")
     nats = [e for e in events if e['nats']]
     if nats:
         print("[fill] Нацпроекты:")
@@ -798,6 +811,7 @@ def cmd_sync(args):
         write_event(cell, e)
         snap[(day, e['canon'], title_norm(e['title']))] = {
             'day': day, 'canon': e['canon'], 'title': e['title'], 'start': e['start'],
+            'gov_marker': e.get('gov_marker', False),
             'sig': cell_text_norm(cell)}
         report.append(f"  ДОБАВЛЕНО {day_names_l(monday)[day]}: {e['canon']}: {e['title'][:70]}")
 
