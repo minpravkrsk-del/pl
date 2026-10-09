@@ -46,7 +46,7 @@ TOKEN = os.environ.get("YADISK_TOKEN", "").strip()
 if not (FORM_PUBLIC_URL and FORM_NAME_IN_FOLDER and FORM_DISK_PATH):
     sys.exit("FORM_URL / FORM_NAME / FORM_PATH not set")
 API = "https://cloud-api.yandex.net/v1/disk"
-UA = {"User-Agent": "mediaplan-runner"}
+UA = {"User-Agent": "auto-runner"}
 
 
 def _req(url, token=None):
