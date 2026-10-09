@@ -1,0 +1,49 @@
+name: mediaplan
+
+on:
+  schedule:
+    - cron: "0 3 * * 4"     # Чт 03:00 UTC = 10:00 Красноярск — очистка разделов (prep)
+    - cron: "0 10 * * 4"    # Чт 10:00 UTC = 17:00 Красноярск — заполнение из календаря (fill)
+    - cron: "30 2 * * 5"    # Пт 02:30 UTC = 09:30 Красноярск — сверка (sync)
+    - cron: "0 3 * * 5"     # Пт 03:00 UTC = 10:00 Красноярск — сверка (sync)
+    - cron: "50 3 * * 5"    # Пт 03:50 UTC = 10:50 Красноярск — сверка (sync)
+    - cron: "30 4 * * 5"    # Пт 04:30 UTC = 11:30 Красноярск — сверка (sync)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим: prep | fill | sync (пусто — авто по времени)"
+        required: false
+        default: "sync"
+
+permissions:
+  contents: write
+
+jobs:
+  mediaplan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install python-docx
+      - name: Запуск
+        env:
+          YC_API_KEY: ${{ secrets.YC_API_KEY }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          if [ -n "${{ inputs.mode }}" ]; then
+            python scripts/runner.py ${{ inputs.mode }}
+          else
+            python scripts/runner.py
+          fi
+      - name: Сохранить снапшот в репозиторий
+        run: |
+          git config user.name "mediaplan-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/
+          if ! git diff --cached --quiet; then
+            git commit -m "снапшот $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
