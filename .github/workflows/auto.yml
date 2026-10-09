@@ -35,6 +35,7 @@ jobs:
           STATE_PATH: ${{ secrets.STATE_PATH }}
           SECTIONS: ${{ secrets.SECTIONS }}
           GOVERNORS: ${{ secrets.GOVERNORS }}
+          GOV_MARKER: ${{ secrets.GOV_MARKER }}
           YC_API_KEY: ${{ secrets.YC_API_KEY }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
