@@ -1,18 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Инструмент автообновления недельной формы (v6).
 
-Режимы:
-  prep  — очистить заполненные ячейки между разделами, обновить даты недели.
-  fill  — заполнить ОРГАНЫ ВЛАСТИ из основного календаря и ГУБЕРНАТОР
-          из календаря «График ММК» (CalDAV), сохранить снапшот.
-  sync  — сверка с обоими календарями: добавить новые, удалить пропавшие;
-          ручные правки не перезаписывает.
-
-Примеры:
-  python tool.py prep --monday 2026-10-19 --out form.docx
-  python tool.py fill --monday 2026-10-19 --src form.docx --out form_filled.docx --state state.json
-  python tool.py sync --monday 2026-10-19 --src form_filled.docx --out form_synced.docx --state state.json
 """
 import sys, os, re, json, base64, argparse, difflib, urllib.request, urllib.parse
 from datetime import datetime, timedelta
@@ -451,11 +439,14 @@ def write_event(cell, ev):
 
 
 def write_event_gov(cell, ev):
-    """Событие графика губернатора в ячейку ГУБЕРНАТОР: название (+ описание)."""
+    """Событие графика губернатора в ячейку ГУБЕРНАТОР: название, описание,
+    форматы (по умолчанию соцсети, пресс-релиз, СМИ)."""
     clear_cell(cell)
     lines = [polish_text(ev['title'])]
     if ev.get('desc'):
         lines += ['', polish_text(ev['desc'])]
+    lines += [''] + [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f
+                     for f in ev.get('formats', [])]
     p = cell.add_paragraph()
     add_lines(p, lines, size=10)
 
@@ -522,6 +513,15 @@ def collect_week_events(monday):
     return dedup, skipped_gov, len(events)
 
 
+def gov_formats(desc):
+    """Форматы для мероприятий губернатора: если в описании форматы указаны —
+    берём их (normalize_formats), иначе по умолчанию: соцсети, пресс-релиз, СМИ."""
+    fmts = normalize_formats(desc)
+    if fmts == ['пресс-релиз', 'соцсети']:  # признак «ничего не указано»
+        return ['соцсети', 'пресс-релиз', 'СМИ']
+    return fmts
+
+
 def collect_gov_week_events(monday):
     """События недели календаря губернатора. Возвращает (события, всего, настроен ли)."""
     if not (GOV_CAL_URL and GOV_CAL_USER and GOV_CAL_PASS):
@@ -540,6 +540,7 @@ def collect_gov_week_events(monday):
             'title': ev['title'],
             'desc': clean_desc(ev['desc']),
             'start': s.strftime('%Y-%m-%d %H:%M'),
+            'formats': gov_formats(ev['desc']),
         })
     seen, dedup = set(), []
     for e in week:
