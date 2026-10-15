@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Инструмент автообновления недельной формы (v7).
+
+Режимы:
+  prep  — очистить заполненные ячейки между разделами, обновить даты недели.
+  fill  — заполнить из календаря, сохранить снапшот.
+  sync  — сверка с обоими календарями: добавить новые, удалить пропавшие;
+          ручные правки не перезаписывает.
 
 """
 import sys, os, re, json, base64, argparse, difflib, urllib.request, urllib.parse
@@ -14,10 +21,9 @@ CALENDAR_URL = ("https://calendar.yandex.ru/export/html.xml"
                 f"?private_token={CAL_TOKEN}"
                 "&tz_id=Asia/Krasnoyarsk&limit=300")
 
-# календарь графика губернатора (CalDAV). Не задан — раздел ГУБЕРНАТОР не трогаем.
+# календарь графика губернатора: ссылка экспорта/подписки (без авторизации).
+# Не задан — раздел ГУБЕРНАТОР не трогаем.
 GOV_CAL_URL = os.environ.get("GOV_CAL_URL", "").strip()
-GOV_CAL_USER = os.environ.get("GOV_CAL_USER", "").strip()
-GOV_CAL_PASS = os.environ.get("GOV_CAL_PASS", "").strip()
 
 # форма: публичная ссылка на папку + имя файла внутри (только из переменных окружения)
 FOLDER_PUBLIC_URL = os.environ.get("FORM_URL", "").strip()
@@ -104,11 +110,29 @@ def fetch_calendar():
 
 
 def fetch_gov_calendar():
-    """Скачать .ics календаря губернатора с Basic-авторизацией."""
-    req = urllib.request.Request(GOV_CAL_URL, headers={'User-Agent': 'Mozilla/5.0'})
-    auth = base64.b64encode(f"{GOV_CAL_USER}:{GOV_CAL_PASS}".encode()).decode()
-    req.add_header('Authorization', 'Basic ' + auth)
+    """Скачать календарь губернатора по ссылке экспорта (без авторизации).
+    Ссылка может быть webcal:// — переводим в https://."""
+    url = GOV_CAL_URL
+    if url.lower().startswith('webcal://'):
+        url = 'https://' + url[len('webcal://'):]
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     return urllib.request.urlopen(req, timeout=60).read().decode('utf-8', 'replace')
+
+
+def parse_gov_calendar(text):
+    """Определить формат выгрузки (iCal или HTML Яндекс Календаря)
+    и вернуть события [{title, desc, start(Datetime)}]."""
+    if 'BEGIN:VCALENDAR' in text.upper():
+        return parse_ics(text)
+    events = []
+    for ev in parse_calendar(text):
+        if not ev['times']:
+            continue
+        start = parse_cal_date(ev['times'][0])
+        if not start:
+            continue
+        events.append({'title': ev['title'], 'desc': ev['desc'], 'start': start})
+    return events
 
 
 def fetch_template(path):
@@ -524,9 +548,9 @@ def gov_formats(desc):
 
 def collect_gov_week_events(monday):
     """События недели календаря губернатора. Возвращает (события, всего, настроен ли)."""
-    if not (GOV_CAL_URL and GOV_CAL_USER and GOV_CAL_PASS):
+    if not GOV_CAL_URL:
         return [], 0, False
-    events = parse_ics(fetch_gov_calendar())
+    events = parse_gov_calendar(fetch_gov_calendar())
     target_start = datetime(monday.year, monday.month, monday.day)
     target_end = target_start + timedelta(days=7)
     week = []
@@ -698,7 +722,7 @@ def cmd_fill(args):
         print("[fill] ГУБ по дням: " + ", ".join(
             f"{(monday + timedelta(days=d)).strftime('%d.%m')}={len(g_per_day.get(d, []))}" for d in range(7)))
     else:
-        print("[fill] ГУБЕРНАТОР: календарь не настроен (GOV_CAL_URL/GOV_CAL_USER/GOV_CAL_PASS) — пропускаю")
+        print("[fill] ГУБЕРНАТОР: календарь не настроен (секрет GOV_CAL_URL не задан) — пропускаю")
 
     # пересчитать индексы строк (вставки могли сдвинуть разделы)
     sections = find_sections(table)
