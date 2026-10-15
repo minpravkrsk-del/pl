@@ -30,8 +30,6 @@ jobs:
           YADISK_TOKEN: ${{ secrets.YADISK_TOKEN }}
           CAL_TOKEN: ${{ secrets.CAL_TOKEN }}
           GOV_CAL_URL: ${{ secrets.GOV_CAL_URL }}
-          GOV_CAL_USER: ${{ secrets.GOV_CAL_USER }}
-          GOV_CAL_PASS: ${{ secrets.GOV_CAL_PASS }}
           FORM_URL: ${{ secrets.FORM_URL }}
           FORM_NAME: ${{ secrets.FORM_NAME }}
           FORM_PATH: ${{ secrets.FORM_PATH }}
