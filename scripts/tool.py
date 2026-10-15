@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Инструмент автообновления недельной формы.
+Инструмент автообновления недельной формы (v6).
 
 Режимы:
-  prep  — четверг 10:00: очистить заполненные ячейки между разделами,
-          обновить даты в первой строке (даты следующей недели).
-  fill  — заполнить основной раздел формы из календаря,
-          сохранить снапшот внесённых мероприятий.
-  sync  — утро 9:30 / 10:00 / 10:50 / 11:30: сверка с календарём:
-          добавить новые, удалить пропавшие; ручные правки не перезаписывает.
+  prep  — очистить заполненные ячейки между разделами, обновить даты недели.
+  fill  — заполнить ОРГАНЫ ВЛАСТИ из основного календаря и ГУБЕРНАТОР
+          из календаря «График ММК» (CalDAV), сохранить снапшот.
+  sync  — сверка с обоими календарями: добавить новые, удалить пропавшие;
+          ручные правки не перезаписывает.
 
 Примеры:
-  python mediaplan_tool.py prep --monday 2026-10-12 --out form.docx
-  python mediaplan_tool.py fill --monday 2026-10-12 --src form.docx --out form_filled.docx --state state.json
-  python mediaplan_tool.py sync --monday 2026-10-12 --src form_filled.docx --out form_synced.docx --state state.json
+  python tool.py prep --monday 2026-10-19 --out form.docx
+  python tool.py fill --monday 2026-10-19 --src form.docx --out form_filled.docx --state state.json
+  python tool.py sync --monday 2026-10-19 --src form_filled.docx --out form_synced.docx --state state.json
 """
-import sys, os, re, json, argparse, difflib, urllib.request, urllib.parse
+import sys, os, re, json, base64, argparse, difflib, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from copy import deepcopy
 
@@ -26,6 +25,12 @@ if not CAL_TOKEN:
 CALENDAR_URL = ("https://calendar.yandex.ru/export/html.xml"
                 f"?private_token={CAL_TOKEN}"
                 "&tz_id=Asia/Krasnoyarsk&limit=300")
+
+# календарь графика губернатора (CalDAV). Не задан — раздел ГУБЕРНАТОР не трогаем.
+GOV_CAL_URL = os.environ.get("GOV_CAL_URL", "").strip()
+GOV_CAL_USER = os.environ.get("GOV_CAL_USER", "").strip()
+GOV_CAL_PASS = os.environ.get("GOV_CAL_PASS", "").strip()
+
 # форма: публичная ссылка на папку + имя файла внутри (только из переменных окружения)
 FOLDER_PUBLIC_URL = os.environ.get("FORM_URL", "").strip()
 FORM_NAME_IN_FOLDER = os.environ.get("FORM_NAME", "").strip()
@@ -35,14 +40,6 @@ MONTHS = {1: 'января', 2: 'февраля', 3: 'марта', 4: 'апре�
           7: 'июля', 8: 'августа', 9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'}
 
 # ------------------------------------------------------------------ органы ---
-# канонич. имя: список псевдонимов (lower, е вместо ё). Порядок не важен:
-# выбирается самое длинное совпадение.
-# ------------------------------------------------------------------ органы ---
-# Фиксированный перечень органов — сокращённые названия строго как в форме.
-# Сопоставление записей календаря: у министерств после приставки «МИН» идёт
-# корень названия (МИНКУЛЬТ → «культ»), по нему запись сводится к канону.
-# Корни вычисляются из самих сокращений; отдельно — агентства и редкие полные
-# названия. Нераспознанное попадает в отчёт «НЕРАСПОЗНАННЫЕ ОРГАНЫ».
 ORDER = ['МИНЗДРАВ', 'МИНОБР', 'МИНСТРОЙ', 'МСП', 'МИНФИН', 'МИНЭК', 'МИНТРАНС',
          'ТУРИЗМ', 'МИНСЕЛЬХОЗ', 'МИНЦИФРЫ', 'ТРУД И ЗАНЯТОСТЬ', 'МИНСОЦ',
          'МИНКУЛЬТ', 'КМНС', 'МИНСПОРТ', 'МОЛОДЕЖКА', 'МИНЭКОЛОГИИ',
@@ -54,14 +51,10 @@ def _root(canon):
     return w[:-1] if w and w[-1] in 'аеёиоуыэюя' else w
 
 
-# корни министерств: длиннейший совпавший корень выигрывает («экологии» →
-# МИНЭКОЛОГИИ, а не МИНЭК)
 MIN_ROOTS = sorted(
     {(_root(c), c) for c in ORDER if c.startswith('МИН') and len(c) > 3},
     key=lambda x: -len(x[0]))
 
-# агентства и особые сокращения: работают по тому же корневому принципу —
-# полные словосочетания сводятся к сокращению; короткие ключи — страховка
 AGENCY_RULES = sorted([
     ('агентство по развитию северных территорий и поддержке коренных малочисленных народов', 'КМНС'),
     ('агентство развития малого и среднего предпринимательства', 'МСП'),
@@ -90,7 +83,6 @@ AGENCY_RULES = sorted([
 ], key=lambda x: -len(x[0]))
 
 
-# точечные опечатки в названиях календаря (регулярки, регистр не важен)
 TYPO_FIXES = [
     (r'на приме\s*-', 'на приёме —'),
     (r'\(\s*уточняется', '(уточняется'),
@@ -98,7 +90,6 @@ TYPO_FIXES = [
     (r'пресс-срелиз', 'пресс-релиз'),
 ]
 
-# нацпроекты / госпрограммы (полные названия для поиска)
 NATPROJ = [
     'Кадры', 'Молодёжь и дети', 'Продолжительная и активная жизнь', 'Семья',
     'Экологическое благополучие', 'Экономика данных и цифровая трансформация государства',
@@ -124,6 +115,14 @@ def fetch_calendar():
     return urllib.request.urlopen(req, timeout=60).read().decode('utf-8')
 
 
+def fetch_gov_calendar():
+    """Скачать .ics календаря губернатора с Basic-авторизацией."""
+    req = urllib.request.Request(GOV_CAL_URL, headers={'User-Agent': 'Mozilla/5.0'})
+    auth = base64.b64encode(f"{GOV_CAL_USER}:{GOV_CAL_PASS}".encode()).decode()
+    req.add_header('Authorization', 'Basic ' + auth)
+    return urllib.request.urlopen(req, timeout=60).read().decode('utf-8', 'replace')
+
+
 def fetch_template(path):
     """Скачать форму: по публичной ссылке на папку (+ путь внутри),
     при недоступности — по старой ссылке на файл."""
@@ -134,7 +133,6 @@ def fetch_template(path):
     try:
         href = json.loads(urllib.request.urlopen(req, timeout=30).read())['href']
     except Exception:
-        # запасной путь — старая публичная ссылка на сам файл
         api = ("https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="
                + urllib.parse.quote(TEMPLATE_PUBLIC_URL))
         req = urllib.request.Request(api, headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
@@ -178,9 +176,48 @@ def parse_cal_date(s):
     return None
 
 
+# --------------------------------------------------------------- ICS (ММК) ---
+def _ics_unfold(text):
+    return re.sub(r'\n[ \t]', '', text.replace('\r\n', '\n'))
+
+
+def _ics_unesc(s):
+    return (s.replace('\\n', '\n').replace('\\N', '\n')
+             .replace('\\,', ',').replace('\\;', ';').replace('\\\\', '\\'))
+
+
+def parse_ics(text):
+    text = _ics_unfold(text)
+    events = []
+    for block in re.split(r'BEGIN:VEVENT', text)[1:]:
+        block = block.split('END:VEVENT')[0]
+        if re.search(r'^STATUS\s*:\s*CANCELLED', block, flags=re.M | re.I):
+            continue
+
+        def prop(name):
+            m = re.search(rf'^{name}[^:\n]*:(.*)$', block, flags=re.M)
+            return _ics_unesc(m.group(1).strip()) if m else ''
+
+        summary = prop('SUMMARY')
+        ds = re.search(r'^DTSTART[^:\n]*:(\S+)', block, flags=re.M)
+        if not ds or not summary:
+            continue
+        v = ds.group(1)
+        try:
+            if len(v) == 8:  # событие на весь день
+                start = datetime(int(v[:4]), int(v[4:6]), int(v[6:8]))
+            elif v.endswith('Z'):
+                start = datetime.strptime(v, '%Y%m%dT%H%M%SZ') + timedelta(hours=7)
+            else:
+                start = datetime.strptime(v, '%Y%m%dT%H%M%S')
+        except ValueError:
+            continue
+        events.append({'title': summary.strip(), 'desc': prop('DESCRIPTION'), 'start': start})
+    return events
+
+
 # ------------------------------------------------------------------- органы ---
 def match_org(h):
-    """(канон, сколько символов нормализованного заголовка занимает орган)"""
     if not h:
         return None, 0
     for key, canon in AGENCY_RULES:
@@ -188,7 +225,7 @@ def match_org(h):
             return canon, len(key)
     parts = h.split(' ', 1)
     w0, tail = parts[0], (parts[1] if len(parts) > 1 else '')
-    if w0 == 'мин' and tail:  # «мин экологии»
+    if w0 == 'мин' and tail:
         for root, canon in MIN_ROOTS:
             if tail.startswith(root):
                 return canon, len(w0) + 1 + len(tail.split(' ')[0])
@@ -198,7 +235,6 @@ def match_org(h):
         for root, canon in MIN_ROOTS:
             if body.startswith(root):
                 return canon, len(w0)
-        # опечатки в корне: близость написания, только корни от 4 символов
         best, best_r = None, 0.0
         for root, canon in MIN_ROOTS:
             if len(root) < 4:
@@ -212,7 +248,6 @@ def match_org(h):
 
 
 def canon_org(title):
-    """(канонич. орган, остаток заголовка)"""
     t = title.strip().lstrip('?').lstrip('!').strip()
     m = re.match(r'^([^:]{1,80}?)[.:]\s+', t + ' ')
     header = (m.group(1) if m else t.split(':')[0]).strip()
@@ -220,7 +255,6 @@ def canon_org(title):
     canon, cut = match_org(h)
     if canon:
         rest = t[cut:].lstrip(' :.·–—-').strip()
-        # дублированный префикс органа ("МИНСТРОЙ: МИНСТРОЙ: ...")
         rest = re.sub(rf'^(?:{re.escape(canon)}\s*[:.·]\s*)+', '', rest, flags=re.I).strip()
         for a, b in TYPO_FIXES:
             rest = re.sub(a, b, rest, flags=re.I)
@@ -259,7 +293,6 @@ def normalize_formats(desc):
 
 
 def find_natproj(text):
-    """Список строк: 'Нацпроект «X»' / 'Госпрограмма «X»'."""
     t = text or ''
     low = t.lower().replace('ё', 'е')
     found = []
@@ -280,8 +313,6 @@ def find_natproj(text):
     for name in NATPROJ:
         nl = name.lower().replace('ё', 'е')
         if f'«{name}»' in t or f'"{name}"' in t or f'“{name}”' in t or f'"{name}"' in t.replace('"', '"'):
-            if ('нацпроект' in low or 'госпрограмм' in low or True) and nl not in low.replace(f'«{nl}»', ''):
-                pass
             add('Нацпроект', name)
         elif nl in low and ('нацпроект' in low or 'госпрограмм' in low):
             add('Нацпроект', name)
@@ -310,13 +341,11 @@ def line_is_format_only(line):
 
 
 def clean_desc(desc):
-    """Убрать из описания чисто-форматные строки и хвост-перечень форматов."""
     if not desc:
         return ''
     lines = [l for l in (x.strip() for x in desc.split('\n')) if l]
     kept = [l for l in lines if not line_is_format_only(l)]
     out = '\n'.join(kept)
-    # хвост из перечисления форматов в конце текста
     out = re.sub(
         r'[,.;:\s]*(?:пресс-релиз|релиз|соцсети|соц\.\s*сети|пост|тв|сми|радио)'
         r'(?:[,.;:\s]+(?:пресс-релиз|релиз|соцсети|пост|тв|сми|радио))*[.,]?\s*$',
@@ -374,7 +403,6 @@ def set_run(run, size=10, name='Times New Roman', bold=None):
 
 
 def add_lines(paragraph, lines, size=10):
-    """Строки в одном абзаце через перенос строки (как в шаблоне)."""
     for i, ln in enumerate(lines):
         r = paragraph.add_run(ln)
         set_run(r, size=size)
@@ -383,36 +411,25 @@ def add_lines(paragraph, lines, size=10):
 
 
 def polish_text(text):
-    """Редакторская нормализация текста события (орфография/грамматика):
-    - первый символ после «ОРГАН:» — заглавная;
-    - точка в конце текста (если нет .!?…» и т.п.);
-    - пробел перед точкой/запятой убирается, двойные пробелы сжимаются;
-    - « т.д.", « т.п.» — нормализация не делается (не лезем в стиль).
-    """
     if not text or not text.strip():
         return text
     t = re.sub(r'[ \t]+', ' ', text.strip())
     t = re.sub(r'\s+([.,;:!?])', r'\1', t)
-    # пробел после , . ; : !? между словами (если его нет)
     t = re.sub(r'([а-яёa-z][,;:.!?])(?=[а-яёА-ЯЁA-Z])', r'\1 ', t)
-    # капитализация после «ОРГАН:»
     m = re.match(r'^([А-ЯЁ]{2,}(?: [А-ЯЁ]{2,})?):\s*(.*)$', t, flags=re.S)
     if m and m.group(2):
         head, rest = m.group(1), m.group(2)
         rest = rest[0].upper() + rest[1:]
         t = f"{head}: {rest}"
     elif t and t[0].isalpha() and t[0].islower():
-        # первое слово текста (описание) — с заглавной
         t = t[0].upper() + t[1:]
-    # точка в конце (если нет завершающей пунктуации)
     if t and t[-1] not in '.!?…»)"]':
         t += '.'
     return t
 
 
 def write_event(cell, ev):
-    """Записать мероприятие в ячейку: пометка участием и нацпроект(ы) жирным,
-    пустая строка, ОРГАН: заголовок, пустая строка, описание, пустая строка, форматы."""
+    """Событие в ячейку ОРГАНОВ ВЛАСТИ."""
     clear_cell(cell)
     if ev.get('gov_marker') and GOV_MARKER:
         p = cell.add_paragraph()
@@ -433,6 +450,16 @@ def write_event(cell, ev):
     add_lines(p, lines, size=10)
 
 
+def write_event_gov(cell, ev):
+    """Событие графика губернатора в ячейку ГУБЕРНАТОР: название (+ описание)."""
+    clear_cell(cell)
+    lines = [polish_text(ev['title'])]
+    if ev.get('desc'):
+        lines += ['', polish_text(ev['desc'])]
+    p = cell.add_paragraph()
+    add_lines(p, lines, size=10)
+
+
 def cell_text_norm(cell):
     return re.sub(r'\s+', ' ', cell.text).strip().lower()
 
@@ -442,7 +469,6 @@ def title_norm(t):
 
 
 def cell_contains_title(cell, title):
-    """Похоже ли событие уже стоит в ячейке (сравнение по значимым словам)."""
     ct = cell_text_norm(cell)
     tn = title_norm(title)
     if not ct or not tn:
@@ -456,7 +482,7 @@ def cell_contains_title(cell, title):
 
 # -------------------------------------------------------------------- режимы ---
 def collect_week_events(monday):
-    """События недели из календаря: [{'day', 'canon', 'title', 'desc', 'start', 'formats', 'nats', 'gov'}]"""
+    """События недели основного календаря (раздел ОРГАНЫ ВЛАСТИ)."""
     html = fetch_calendar()
     events = parse_calendar(html)
     target_start = datetime(monday.year, monday.month, monday.day)
@@ -485,7 +511,6 @@ def collect_week_events(monday):
             'nats': find_natproj(text_all),
             'gov_marker': bool(gov_hit and GOV_MARKER),
         })
-    # дедупликация одинаковых
     seen = set()
     dedup = []
     for e in week:
@@ -497,6 +522,35 @@ def collect_week_events(monday):
     return dedup, skipped_gov, len(events)
 
 
+def collect_gov_week_events(monday):
+    """События недели календаря губернатора. Возвращает (события, всего, настроен ли)."""
+    if not (GOV_CAL_URL and GOV_CAL_USER and GOV_CAL_PASS):
+        return [], 0, False
+    events = parse_ics(fetch_gov_calendar())
+    target_start = datetime(monday.year, monday.month, monday.day)
+    target_end = target_start + timedelta(days=7)
+    week = []
+    for ev in events:
+        s = ev['start']
+        if not (target_start <= s < target_end):
+            continue
+        week.append({
+            'day': (s - target_start).days,
+            'canon': 'ГУБЕРНАТОР',
+            'title': ev['title'],
+            'desc': clean_desc(ev['desc']),
+            'start': s.strftime('%Y-%m-%d %H:%M'),
+        })
+    seen, dedup = set(), []
+    for e in week:
+        key = (e['day'], title_norm(e['title']), e['start'])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(e)
+    return dedup, len(events), True
+
+
 def cmd_prep(args):
     if not args.src:
         n = fetch_template('/tmp/_template.docx')
@@ -506,7 +560,6 @@ def cmd_prep(args):
     table = doc.tables[0]
     sections = find_sections(table)
     monday = datetime.strptime(args.monday, '%Y-%m-%d').date()
-    # очистка заполненных ячеек между разделами
     cleared = 0
     for name, sec in sections.items():
         if name == 'СПЕЦПРОЕКТЫ' and args.keep_spec:
@@ -517,7 +570,6 @@ def cmd_prep(args):
                 if c.text.strip():
                     cleared += 1
                 clear_cell(c)
-    # даты следующей недели
     for ci in range(7):
         cell = table.cell(0, ci)
         d = monday + timedelta(days=ci)
@@ -530,7 +582,6 @@ def cmd_prep(args):
         else:
             r = p.add_run(text)
             r.bold = True
-    # строка праздников (вторая строка): очистить все дни
     holidays_cleared = 0
     for ci in range(7):
         c = table.cell(1, ci)
@@ -548,18 +599,19 @@ def cmd_prep(args):
         print("[prep] Строка праздников пуста.")
 
 
-def ensure_org_rows(table, sections, needed):
-    org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
+def ensure_section_rows(table, sections, name, needed):
+    """Довести число строк раздела до max(needed): новые строки вставляются
+    сразу ПОСЛЕ последней строки раздела (не в конец таблицы)."""
+    body = sections[name]['body']
     max_len = max(needed) if needed else 1
-    if max_len > len(org_body):
-        tbl = table._tbl
-        last_tr = table.rows[org_body[-1]]._tr
-        for _ in range(max_len - len(org_body)):
-            new_tr = deepcopy(last_tr)
-            tbl.append(new_tr)
-        # очистить только добавленные строки (после пересчёта секций)
-        fresh_rows = find_sections(table)['ОРГАНЫ ВЛАСТИ']['body'][len(org_body):]
-        for ri in fresh_rows:
+    if max_len > len(body):
+        anchor = table.rows[body[-1]]._tr
+        for _ in range(max_len - len(body)):
+            new_tr = deepcopy(anchor)
+            anchor.addnext(new_tr)
+            anchor = new_tr
+        fresh = find_sections(table)[name]['body'][len(body):]
+        for ri in fresh:
             for c in table.rows[ri].cells:
                 clear_cell(c)
     return find_sections(table)
@@ -573,14 +625,17 @@ def cmd_fill(args):
     table = doc.tables[0]
     sections = find_sections(table)
     require_sections(sections, 'fill')
+    monday = datetime.strptime(args.monday, '%Y-%m-%d').date()
+
     org_filled = sum(1 for ri in sections['ОРГАНЫ ВЛАСТИ']['body'] for ci in range(7)
                      if table.cell(ri, ci).text.strip())
-    if org_filled:
-        print(f"[fill] ОТМЕНА: в разделе ОРГАНЫ ВЛАСТИ есть заполненные ячейки ({org_filled}). "
-              "Это либо ручное заполнение, либо не выполнялся prep. Ручное не трогаю; "
-              "если это остатки прошлой недели — сначала запустите prep.")
+    gov_filled = sum(1 for ri in sections['ГУБЕРНАТОР']['body'] for ci in range(7)
+                     if table.cell(ri, ci).text.strip())
+    if org_filled or gov_filled:
+        print(f"[fill] ОТМЕНА: есть заполненные ячейки (ОРГАНЫ ВЛАСТИ: {org_filled}, "
+              f"ГУБЕРНАТОР: {gov_filled}). Это либо ручное заполнение, либо не выполнялся prep. "
+              "Ручное не трогаю; если это остатки прошлой недели — сначала запустите prep.")
         sys.exit(3)
-    monday = datetime.strptime(args.monday, '%Y-%m-%d').date()
 
     state = {}
     if args.state:
@@ -600,7 +655,7 @@ def cmd_fill(args):
     for d in per_day:
         per_day[d].sort(key=lambda x: (order_index(x['canon']), x['start']))
     needed = [len(per_day.get(d, [])) for d in range(7)]
-    sections = ensure_org_rows(table, sections, needed)
+    sections = ensure_section_rows(table, sections, 'ОРГАНЫ ВЛАСТИ', needed)
     org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
 
     snapshot = []
@@ -609,17 +664,53 @@ def cmd_fill(args):
             cell = table.cell(org_body[k], d)
             write_event(cell, ev)
             snapshot.append({
-                'day': d, 'canon': ev['canon'], 'title': ev['title'],
+                'sec': 'org', 'day': d, 'canon': ev['canon'], 'title': ev['title'],
                 'start': ev['start'], 'gov_marker': ev.get('gov_marker', False),
-                'sig': None,  # пересчитается после LLM-полировки
+                'sig': None,
             })
+
+    # --- календарь губернатора (График ММК) ---
+    gov_body = sections['ГУБЕРНАТОР']['body']
+    gov_events, gov_total, gov_ok = [], 0, False
+    try:
+        gov_events, gov_total, gov_ok = collect_gov_week_events(monday)
+    except Exception as e:
+        print(f"[fill] ГУБЕРНАТОР: календарь недоступен ({e}) — раздел не заполнен")
+    if gov_ok:
+        g_per_day = {}
+        for e in gov_events:
+            g_per_day.setdefault(e['day'], []).append(e)
+        for d in g_per_day:
+            g_per_day[d].sort(key=lambda x: x['start'])
+        gneed = [len(g_per_day.get(d, [])) for d in range(7)]
+        sections = ensure_section_rows(table, sections, 'ГУБЕРНАТОР', gneed)
+        gov_body = sections['ГУБЕРНАТОР']['body']
+        for d in range(7):
+            for k, ev in enumerate(g_per_day.get(d, [])):
+                cell = table.cell(gov_body[k], d)
+                write_event_gov(cell, ev)
+                snapshot.append({
+                    'sec': 'gov', 'day': d, 'canon': 'ГУБЕРНАТОР', 'title': ev['title'],
+                    'start': ev['start'], 'sig': None,
+                })
+        print(f"[fill] ГУБЕРНАТОР: событий в календаре всего {gov_total}, на неделю попало {len(gov_events)}")
+        print("[fill] ГУБ по дням: " + ", ".join(
+            f"{(monday + timedelta(days=d)).strftime('%d.%m')}={len(g_per_day.get(d, []))}" for d in range(7)))
+    else:
+        print("[fill] ГУБЕРНАТОР: календарь не настроен (GOV_CAL_URL/GOV_CAL_USER/GOV_CAL_PASS) — пропускаю")
+
+    # пересчитать индексы строк (вставки могли сдвинуть разделы)
+    sections = find_sections(table)
+    org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
+    gov_body = sections['ГУБЕРНАТОР']['body']
 
     # LLM-редактура (если задан YC_API_KEY) — потом пересчитать sig
     changes = llm_polish_org_cells(doc, sections)
     for c in changes:
         print("[llm]", c)
     for s in snapshot:
-        s['sig'] = cell_text_norm(table.cell(org_body[s['day']], s['day']))
+        body = gov_body if s.get('sec') == 'gov' else org_body
+        s['sig'] = cell_text_norm(table.cell(body[s['day']], s['day']))
 
     doc.save(args.out)
     if args.state:
@@ -667,6 +758,7 @@ def cmd_sync(args):
     require_sections(sections, 'sync')
     monday = datetime.strptime(args.monday, '%Y-%m-%d').date()
     org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
+    gov_body = sections['ГУБЕРНАТОР']['body']
 
     try:
         with open(args.state, encoding='utf-8') as f:
@@ -679,70 +771,83 @@ def cmd_sync(args):
         sys.exit(2)
 
     events, gov, total = collect_week_events(monday)
+    try:
+        gov_events, gov_total, gov_ok = collect_gov_week_events(monday)
+    except Exception as e:
+        print(f"[sync] ГУБЕРНАТОР: календарь недоступен ({e}) — этот раздел пропускаю")
+        gov_events, gov_total, gov_ok = [], 0, False
+
     fresh = {}
     for e in events:
-        fresh[(e['day'], e['canon'], title_norm(e['title']))] = e
+        fresh[(e['day'], 'org', e['canon'], title_norm(e['title']))] = e
+    for e in gov_events:
+        fresh[(e['day'], 'gov', 'ГУБЕРНАТОР', title_norm(e['title']))] = e
     snap = {}
     for s in state['events']:
-        snap[(s['day'], s['canon'], title_norm(s['title']))] = s
+        sec = s.get('sec', 'org')
+        snap[(s['day'], sec, s['canon'], title_norm(s['title']))] = s
 
-    # защита снапшота: если раздел ОРГАНЫ ВЛАСТИ в форме полностью пуст,
-    # а в снапшоте есть события — похоже, fill не выполнялся (или форму очистили);
-    # синхронизацию отменяем, чтобы не «удалить» все события из снапшота
+    def body_of(sec):
+        return gov_body if sec == 'gov' else org_body
+
+    # защита снапшота: если раздел пуст, а в снапшоте есть его события —
+    # похоже, fill не выполнялся; синхронизацию отменяем
     org_filled = sum(1 for ri in org_body for ci in range(7)
                      if table.cell(ri, ci).text.strip())
-    if not org_filled and state['events']:
+    gov_filled = sum(1 for ri in gov_body for ci in range(7)
+                     if table.cell(ri, ci).text.strip())
+    snap_org = [s for s in state['events'] if s.get('sec', 'org') == 'org']
+    snap_gov = [s for s in state['events'] if s.get('sec') == 'gov']
+    if not org_filled and snap_org:
         print(f"[sync] ОТМЕНА: раздел ОРГАНЫ ВЛАСТИ пуст, а в снапшоте "
-              f"{len(state['events'])} событий. Похоже, fill не выполнялся. Сначала fill.")
+              f"{len(snap_org)} событий. Похоже, fill не выполнялся. Сначала fill.")
+        sys.exit(3)
+    if gov_ok and not gov_filled and snap_gov:
+        print(f"[sync] ОТМЕНА: раздел ГУБЕРНАТОР пуст, а в снапшоте "
+              f"{len(snap_gov)} событий. Похоже, fill не выполнялся. Сначала fill.")
         sys.exit(3)
 
-    # --- поиск добавлений и удалений ---
-    to_add, to_remove, changed, flagged = [], [], [], []
+    to_add, to_remove, changed = [], [], []
 
-    # совпадения по (день, орган, время) — переименования
     fresh_by_slot = {}
     for k, e in fresh.items():
-        fresh_by_slot.setdefault((k[0], k[1], e['start']), []).append(k)
+        fresh_by_slot.setdefault((k[0], k[1], k[2], e['start']), []).append(k)
     snap_by_slot = {}
     for k, s in snap.items():
-        snap_by_slot.setdefault((k[0], k[1], s['start']), []).append(k)
+        snap_by_slot.setdefault((k[0], k[1], k[2], s['start']), []).append(k)
 
     for k, e in fresh.items():
         if k in snap:
             continue
-        slot = (k[0], k[1], e['start'])
-        matched_snap = None
+        slot = (k[0], k[1], k[2], e['start'])
+        matched = None
         for sk in snap_by_slot.get(slot, []):
-            matched_snap = sk
+            matched = sk
             break
-        if matched_snap:
-            changed.append((matched_snap, e))  # то же событие, изменился заголовок
+        if matched:
+            changed.append((matched, e))
         else:
-            to_add.append(e)
+            to_add.append(k)
 
     for k, s in snap.items():
         if k in fresh:
             continue
-        slot = (k[0], k[1], s['start'])
+        slot = (k[0], k[1], k[2], s['start'])
         if slot in fresh_by_slot:
-            continue  # изменился заголовок — обработано как changed
-        # событие пропало или сдвинулось по времени
-        same_day_org = [ek for ek in fresh if ek[0] == k[0] and ek[1] == k[1]]
-        if same_day_org:
-            flagged.append(('сдвиг по времени', s, [fresh[e]['start'] for e in same_day_org]))
-            to_remove.append(k)
-        else:
-            to_remove.append(k)
+            continue
+        to_remove.append(k)
 
     report = []
 
     # --- удаление пропавших ---
     for k in to_remove:
         s = snap[k]
-        day = s['day']
+        day, sec = s['day'], s.get('sec', 'org')
+        if sec == 'gov' and not gov_ok:
+            continue  # календарь губернатора недоступен — не удаляем
         target = title_norm(s['title'])
         found = None
-        for j, ri in enumerate(org_body):
+        for ri in body_of(sec):
             cell = table.cell(ri, day)
             ct = cell_text_norm(cell)
             if not ct:
@@ -755,24 +860,29 @@ def cmd_sync(args):
         if found:
             ri, how = found
             clear_cell(table.cell(ri, day))
-            report.append(f"  УДАЛЕНО {day_names_l(monday)[day]}: {s['canon']}: {s['title'][:70]} [{how}]")
+            report.append(f"  УДАЛЕНО {day_names_l(monday)[day]} ({'ГУБ' if sec == 'gov' else 'ОРГ'}): "
+                          f"{s['canon']}: {s['title'][:70]} [{how}]")
         else:
-            report.append(f"  ! НЕ НАЙДЕНО для удаления {day_names_l(monday)[day]}: {s['canon']}: {s['title'][:70]} — проверьте вручную")
+            report.append(f"  ! НЕ НАЙДЕНО для удаления {day_names_l(monday)[day]} "
+                          f"({'ГУБ' if sec == 'gov' else 'ОРГ'}): {s['canon']}: {s['title'][:70]} — проверьте вручную")
 
-    # --- перезапись изменившихся (только если ячейка не отредактирована вручную) ---
+    # --- перезапись изменившихся ---
     for sk, e in changed:
         s = snap[sk]
-        day = s['day']
+        day, sec = s['day'], s.get('sec', 'org')
         rewritten = False
-        for ri in org_body:
+        for ri in body_of(sec):
             cell = table.cell(ri, day)
             ct = cell_text_norm(cell)
             if ct and ct == s.get('sig'):
-                write_event(cell, e)
-                snap[sk] = {'day': day, 'canon': e['canon'], 'title': e['title'],
-                            'start': e['start'],
-                            'sig': cell_text_norm(cell)}
-                report.append(f"  ОБНОВЛЕНО {day_names_l(monday)[day]}: {e['canon']}: {e['title'][:60]}")
+                if sec == 'gov':
+                    write_event_gov(cell, e)
+                else:
+                    write_event(cell, e)
+                snap[sk] = dict(s, day=day, canon=e['canon'], title=e['title'],
+                                start=e['start'], sig=cell_text_norm(cell))
+                report.append(f"  ОБНОВЛЕНО {day_names_l(monday)[day]} ({'ГУБ' if sec == 'gov' else 'ОРГ'}): "
+                              f"{e['canon']}: {e['title'][:60]}")
                 rewritten = True
                 break
         if not rewritten:
@@ -780,50 +890,60 @@ def cmd_sync(args):
                           f"{day_names_l(monday)[day]} {s['canon']}: {s['title'][:60]}")
 
     # --- добавление новых ---
-    for e in to_add:
-        day = e['day']
-        # защита от дубля: событие может уже стоять в отредактированной вручную ячейке
+    for k in to_add:
+        e = fresh[k]
+        day, sec = k[0], k[1]
+        body = body_of(sec)
         dup_row = None
-        for ri in org_body:
+        for ri in body:
             if cell_contains_title(table.cell(ri, day), e['title']):
                 dup_row = ri
                 break
         if dup_row is not None:
-            report.append(f"  ? ПОХОЖЕ УЖЕ ЕСТЬ {day_names_l(monday)[day]}: {e['canon']}: {e['title'][:70]} — не добавлял, проверьте")
+            report.append(f"  ? ПОХОЖЕ УЖЕ ЕСТЬ {day_names_l(monday)[day]} ({'ГУБ' if sec == 'gov' else 'ОРГ'}): "
+                          f"{e['canon']}: {e['title'][:70]} — не добавлял, проверьте")
             continue
         while True:
-            cells = [(ri, table.cell(ri, day)) for ri in org_body]
+            cells = [(ri, table.cell(ri, day)) for ri in body]
             empty = [(j, ri) for j, (ri, c) in enumerate(cells) if not c.text.strip()]
             if empty:
                 break
-            ensure_org_rows(table, sections, [len(org_body) + 1] * 7)
-            sections = find_sections(table)
+            sections = ensure_section_rows(table, sections,
+                                           'ГУБЕРНАТОР' if sec == 'gov' else 'ОРГАНЫ ВЛАСТИ',
+                                           [len(body) + 1] * 7)
             org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
-        j0 = empty[0][1]
+            gov_body = sections['ГУБЕРНАТОР']['body']
+            body = body_of(sec)
         chosen = None
-        for j, ri in empty:
-            if j > 0 and canon_of_cell(cells[j - 1][1]) == e['canon']:
-                chosen = ri
-                break
-        if chosen is None:
-            chosen = j0
+        if sec == 'org':
+            j0 = empty[0][1]
+            for j, ri in empty:
+                if j > 0 and canon_of_cell(cells[j - 1][1]) == e['canon']:
+                    chosen = ri
+                    break
+            if chosen is None:
+                chosen = j0
+        else:
+            chosen = empty[0][1]
         cell = table.cell(chosen, day)
-        write_event(cell, e)
-        snap[(day, e['canon'], title_norm(e['title']))] = {
-            'day': day, 'canon': e['canon'], 'title': e['title'], 'start': e['start'],
-            'gov_marker': e.get('gov_marker', False),
-            'sig': cell_text_norm(cell)}
-        report.append(f"  ДОБАВЛЕНО {day_names_l(monday)[day]}: {e['canon']}: {e['title'][:70]}")
+        if sec == 'gov':
+            write_event_gov(cell, e)
+        else:
+            write_event(cell, e)
+        snap[k] = {
+            'sec': sec, 'day': day, 'canon': e['canon'], 'title': e['title'],
+            'start': e['start'], 'sig': cell_text_norm(cell)}
+        report.append(f"  ДОБАВЛЕНО {day_names_l(monday)[day]} ({'ГУБ' if sec == 'gov' else 'ОРГ'}): "
+                      f"{e['canon']}: {e['title'][:70]}")
 
     # --- сохранение ---
     state['events'] = list(snap.values())
     changes = llm_polish_org_cells(doc, sections)
     if changes:
         print("[llm]", *changes, sep='\n')
-        # обновить sig в снапшоте под изменённые ячейки
         for s in state['events']:
             day = s['day']
-            for ri in org_body:
+            for ri in body_of(s.get('sec', 'org')):
                 ct = cell_text_norm(table.cell(ri, day))
                 if ct and s['title'].lower() in ct:
                     s['sig'] = ct
@@ -833,6 +953,8 @@ def cmd_sync(args):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
     print(f"[sync] Календарь: всего {total}, на неделе {len(events)} (+{len(gov)} вне раздела)")
+    if gov_ok:
+        print(f"[sync] ГУБЕРНАТОР: всего {gov_total}, на неделе {len(gov_events)}")
     print(f"[sync] Добавлено: {len(to_add)}, удалено: {len(to_remove)}, обновлено: {len(changed)}")
     for r in report:
         print(r)
@@ -849,8 +971,6 @@ def day_names_l(monday):
     return [(monday + timedelta(days=d)).strftime('%d.%m') for d in range(7)]
 
 
-
-
 # ---------- LLM-редактура (опционально) ----------
 LLM_API_KEY = os.environ.get("YC_API_KEY", "").strip()
 LLM_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "").strip()
@@ -862,8 +982,6 @@ def llm_available():
 
 
 def llm_polish_texts(texts):
-    """Пакетная редактура текстов через YandexGPT. Возвращает список той же длины.
-    При любой ошибке — исходные тексты (fallback на правила)."""
     if not texts or not llm_available():
         return texts
     SEP = "\n===\n"
@@ -905,8 +1023,6 @@ def llm_polish_texts(texts):
 
 
 def llm_polish_org_cells(doc, sections):
-    """Прогнать заполненные ячейки ОРГАНОВ ВЛАСТИ через LLM (один пакет).
-    Возвращает список описаний правок для отчёта."""
     if not llm_available():
         return []
     table = doc.tables[0]
