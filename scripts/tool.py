@@ -4,10 +4,16 @@
 
 Режимы:
   prep  — очистить заполненные ячейки между разделами, обновить даты недели.
-  fill  — заполнить из календаря, сохранить снапшот.
+  fill  — заполнить ОРГАНЫ ВЛАСТИ из основного календаря и ГУБЕРНАТОР
+          из календаря «График ММК» (ссылка экспорта, без авторизации),
+          сохранить снапшот.
   sync  — сверка с обоими календарями: добавить новые, удалить пропавшие;
           ручные правки не перезаписывает.
 
+Примеры:
+  python tool.py prep --monday 2026-10-19 --out form.docx
+  python tool.py fill --monday 2026-10-19 --src form.docx --out form_filled.docx --state state.json
+  python tool.py sync --monday 2026-10-19 --src form_filled.docx --out form_synced.docx --state state.json
 """
 import sys, os, re, json, base64, argparse, difflib, urllib.request, urllib.parse
 from datetime import datetime, timedelta
@@ -183,8 +189,19 @@ MONTH_IDX = {v: k for k, v in MONTHS.items()}
 def parse_cal_date(s):
     m = re.match(r'(\d+)\s+([а-яё]+)\s+(\d+)\s+(\d+):(\d+)', s)
     if m:
-        return datetime(int(m.group(3)), MONTH_IDX.get(m.group(2), 0),
+        month = MONTH_IDX.get(m.group(2), 0)
+        if not month:
+            return None
+        return datetime(int(m.group(3)), month,
                         int(m.group(1)), int(m.group(4)), int(m.group(5)))
+    # событие на весь день: "26 октября 2026" или "26 октября"
+    m = re.search(r'(\d+)\s+([а-яё]+)(?:\s+(\d{4}))?\s*$', s.strip())
+    if m:
+        month = MONTH_IDX.get(m.group(2), 0)
+        if not month:
+            return None
+        year = int(m.group(3)) if m.group(3) else datetime.now().year
+        return datetime(year, month, int(m.group(1)))
     return None
 
 
