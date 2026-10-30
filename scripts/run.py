@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
+загружает результат и снапшот обратно.
+
+v2 (30.10.2026) — устойчивость к сбоям:
+  - каждая сетевая операция Диска повторяется до 3 раз с паузой 20 с;
+  - честный код выхода: любой незавершённый режим (ошибка tool.py, сбой сети,
+    отмена загрузки из-за правки формы) завершает прогон кодом 1 — в GitHub
+    Actions он становится КРАСНЫМ и шлёт уведомление, вместо тихо пустого плана.
+  - в логе прямо виден пройденный этап: скачивание формы -> снапшот -> tool ->
+    загрузка снапшота -> загрузка формы.
+"""
 
 import argparse
 import json
 import os
 import subprocess
 import sys
+import time
+import traceback
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -25,12 +38,27 @@ if not (FORM_PUBLIC_URL and FORM_NAME_IN_FOLDER and FORM_DISK_PATH):
 API = "https://cloud-api.yandex.net/v1/disk"
 UA = {"User-Agent": "auto-runner"}
 
+RETRIES = 3        # попыток на сетевую операцию
+RETRY_DELAY = 20   # секунд между попытками
+
 
 def _req(url, token=None):
     h = dict(UA)
     if token:
         h["Authorization"] = "OAuth " + token
     return urllib.request.Request(url, headers=h)
+
+
+def retry_call(fn, label, tries=RETRIES, delay=RETRY_DELAY):
+    """Выполнить сетевую операцию с повторами; на последней попытке — исключение наружу."""
+    for i in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if i == tries:
+                raise
+            print(f"[runner] {label}: попытка {i}/{tries} не удалась ({e}); повтор через {delay} c")
+            time.sleep(delay)
 
 
 def disk_info():
@@ -45,7 +73,7 @@ def disk_info():
 def disk_download():
     """Скачать форму: с авторизацией (если есть токен) или по публичной ссылке."""
     if TOKEN:
-        href, modified, size = disk_info()
+        href, modified, size = retry_call(disk_info, "метаданные формы")
         print(f"[runner] Форма на Диске: {size} байт, изменена: {modified}")
     else:
         url = ("https://cloud-api.yandex.net/v1/disk/public/resources/download"
@@ -55,8 +83,13 @@ def disk_download():
             href = json.load(r)["href"]
         modified = None
         print("[runner] Скачиваю форму по публичной ссылке (без токена)")
-    with urllib.request.urlopen(_req(href), timeout=120) as r:
-        return r.read(), modified
+
+    def _fetch(h):
+        with urllib.request.urlopen(_req(h), timeout=120) as r:
+            return r.read()
+
+    data = retry_call(lambda: _fetch(href), "скачивание формы")
+    return data, modified
 
 
 def disk_upload(data):
@@ -101,9 +134,9 @@ def state_download(monday, workdir):
     if not TOKEN:
         return None
     local = os.path.join(workdir, f"state_{monday}.json")
-    url = (f"{API}/resources/download?path="
-           + urllib.parse.quote(STATE_PATH))
-    try:
+
+    def _get():
+        url = (f"{API}/resources/download?path=" + urllib.parse.quote(STATE_PATH))
         with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as rr:
             href = json.load(rr)["href"]
         with urllib.request.urlopen(_req(href), timeout=60) as rr:
@@ -111,6 +144,9 @@ def state_download(monday, workdir):
         with open(local, "wb") as f:
             f.write(data)
         return local
+
+    try:
+        return retry_call(_get, "скачивание снапшота")
     except Exception:
         return None
 
@@ -131,6 +167,7 @@ def state_upload(local):
 
 
 def run_mode(mode, monday, workdir):
+    """Вернуть статус: 'uploaded' | 'nochange' | 'failed'."""
     src = os.path.join(workdir, "form_current.docx")
     out = os.path.join(workdir, "form_new.docx")
     state = None
@@ -140,8 +177,9 @@ def run_mode(mode, monday, workdir):
             state = os.path.join(workdir, f"state_{monday}.json")
             if mode == "sync":
                 print("[runner] ОТМЕНА: снапшот недели не найден на Диске. Сначала fill.")
-                return False
-    data, modified = disk_download()
+                return "failed"
+    print("[runner] Этап 1/5: скачивание формы")
+    data, modified = retry_call(disk_download, "скачивание формы")
     with open(src, "wb") as f:
         f.write(data)
 
@@ -149,25 +187,29 @@ def run_mode(mode, monday, workdir):
            "--monday", monday, "--src", src, "--out", out]
     if mode in ("fill", "sync"):
         cmd += ["--state", state]
-    print("[runner] ЗАПУСК:", " ".join(cmd))
+    print("[runner] Этап 2/5: ЗАПУСК:", " ".join(cmd))
     rc = subprocess.call(cmd)
     if rc != 0:
         print(f"[runner] Режим {mode} завершился с кодом {rc} — на Диск ничего не загружено")
-        return False
+        return "failed"
 
+    print("[runner] Этап 3/5: загрузка снапшота")
     if mode in ("fill", "sync") and os.path.exists(state):
-        state_upload(state)
+        retry_call(state_upload, "загрузка снапшота")
     with open(out, "rb") as f:
         new_data = f.read()
     if new_data == data:
         print("[runner] Файл не изменился — загрузка на Диск не нужна")
-        return False
+        return "nochange"
+    print("[runner] Этап 4/5: проверка, что форму не правили во время работы")
     if modified is not None:
-        if disk_info()[1] != modified:
+        current = retry_call(lambda: disk_info()[1], "метаданные формы")
+        if current != modified:
             print("[runner] ОТМЕНА ЗАГРУЗКИ: форму редактировали во время работы робота. "
                   "Ничего не перезаписано — запустите ещё раз позже.")
-            return False
-    return disk_upload(new_data)
+            return "failed"
+    print("[runner] Этап 5/5: загрузка формы")
+    return "uploaded" if retry_call(lambda: disk_upload(new_data), "загрузка формы") else "nochange"
 
 
 def main():
@@ -184,9 +226,18 @@ def main():
         return
     monday = args.monday or str(next_monday())
     workdir = "/tmp" if os.path.isdir("/tmp") else os.getcwd()
-    uploaded = run_mode(mode, monday, workdir)
+    try:
+        status = run_mode(mode, monday, workdir)
+    except Exception:
+        print("[runner] СБОЙ раннера:")
+        traceback.print_exc()
+        status = "failed"
     print(f"[runner] Итог: {mode} за неделю {monday}; загрузка на Диск: "
-          f"{'выполнена' if uploaded else 'нет'}")
+          f"{'выполнена' if status == 'uploaded' else 'нет'}")
+    if status == "failed":
+        print("[runner] ЗАВЕРШЕНО С ОШИБКОЙ — прогон помечен как упавший; "
+              "изменения на Диск могли не попасть, запустите режим ещё раз")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
