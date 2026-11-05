@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Инструмент автообновления недельной формы (v7).
+Инструмент автообновления недельной формы (v7.2).
+
+v7.2 (05.11.2026): фикс падения fill при событиях губернатора, если строк в разделе
+ГУБЕРНАТОР меньше 7 (IndexError body[day]); подписи ячеек (sig) теперь считаются
+по реальной ячейке события (ранг внутри дня), а не по body[day] — sync больше не
+показывает ложное «не тронуто».
 
 Режимы:
   prep  — очистить заполненные ячейки между разделами, обновить даты недели.
@@ -706,7 +711,7 @@ def cmd_fill(args):
             cell = table.cell(org_body[k], d)
             write_event(cell, ev)
             snapshot.append({
-                'sec': 'org', 'day': d, 'canon': ev['canon'], 'title': ev['title'],
+                'sec': 'org', 'day': d, 'k': k, 'canon': ev['canon'], 'title': ev['title'],
                 'start': ev['start'], 'gov_marker': ev.get('gov_marker', False),
                 'sig': None,
             })
@@ -732,7 +737,7 @@ def cmd_fill(args):
                 cell = table.cell(gov_body[k], d)
                 write_event_gov(cell, ev)
                 snapshot.append({
-                    'sec': 'gov', 'day': d, 'canon': 'ГУБЕРНАТОР', 'title': ev['title'],
+                    'sec': 'gov', 'day': d, 'k': k, 'canon': 'ГУБЕРНАТОР', 'title': ev['title'],
                     'start': ev['start'], 'sig': None,
                 })
         print(f"[fill] ГУБЕРНАТОР: событий в календаре всего {gov_total}, на неделю попало {len(gov_events)}")
@@ -752,7 +757,7 @@ def cmd_fill(args):
         print("[llm]", c)
     for s in snapshot:
         body = gov_body if s.get('sec') == 'gov' else org_body
-        s['sig'] = cell_text_norm(table.cell(body[s['day']], s['day']))
+        s['sig'] = cell_text_norm(table.cell(body[s['k']], s['day']))
 
     doc.save(args.out)
     if args.state:
