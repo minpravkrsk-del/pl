@@ -3,7 +3,14 @@
 """Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
 загружает результат и снапшот обратно.
 
-v2.1 (05.11.2026) — v2 + фикс вызова state_upload:
+v2.3 (05.11.2026) — v2.2 + штатная отмена не помечается ошибкой:
+  * перед перезаписью формы старая версия сохраняется на Диск (form_prev.docx);
+  * после загрузки файл скачивается обратно и сверяется по md5;
+  * при расхождении — повтор загрузки, при неудаче — откат на бэкап;
+  * если файл открыт в редакторе Яндекс Диска (залочен) — терпеливые повторы
+    и понятное сообщение вместо красной тишины;
+  * штатный отказ tool.py (защита данных, код выхода 3) — прогон зелёный
+    со статусом "skipped", а не красный;
   - каждая сетевая операция Диска повторяется до 3 раз с паузой 20 с;
   - честный код выхода: любой незавершённый режим (ошибка tool.py, сбой сети,
     отмена загрузки из-за правки формы) завершает прогон кодом 1 — в GitHub
@@ -13,6 +20,7 @@ v2.1 (05.11.2026) — v2 + фикс вызова state_upload:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -32,6 +40,7 @@ FORM_PUBLIC_URL = os.environ.get("FORM_URL", "").strip()
 FORM_NAME_IN_FOLDER = os.environ.get("FORM_NAME", "").strip()
 FORM_DISK_PATH = os.environ.get("FORM_PATH", "").strip()
 STATE_PATH = os.environ.get("STATE_PATH", "disk:/_auto/state.json").strip()
+FORM_BACKUP_PATH = os.environ.get("FORM_BACKUP_PATH", "disk:/_auto/form_prev.docx")
 TOKEN = os.environ.get("YADISK_TOKEN", "").strip()
 if not (FORM_PUBLIC_URL and FORM_NAME_IN_FOLDER and FORM_DISK_PATH):
     sys.exit("FORM_URL / FORM_NAME / FORM_PATH not set")
@@ -92,22 +101,37 @@ def disk_download():
     return data, modified
 
 
-def disk_upload(data):
+def disk_upload(data, prev=None):
+    """Безопасно перезаписать форму на Диске.
+
+    1. Сначала сохранить бэкап текущей версии (form_prev.docx) — best effort.
+    2. Затем перезаписать форму с проверкой md5 после записи.
+    3. Если форма остаётся битой — восстановить бэкап и сдаться честно."""
     if not TOKEN:
         print("[runner] YADISK_TOKEN не задан — загрузка на Диск пропущена (тестовый режим)")
         return False
-    url = f"{API}/resources/upload?path={urllib.parse.quote(FORM_DISK_PATH)}&overwrite=true"
-    with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as r:
-        href = json.load(r).get("href")
-    if not href:
-        raise RuntimeError("Диск не вернул ссылку для загрузки")
-    req = urllib.request.Request(
-        href, data=data, method="PUT",
-        headers={**UA, "Content-Type": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=180) as r:
-        r.read()
-    print("[runner] Форма загружена на Диск")
-    return True
+    if prev:
+        try:
+            if safe_upload(FORM_BACKUP_PATH, prev, "бэкап формы",
+                           "application/octet-stream", tries=2, delay=5):
+                print("[runner] Бэкап прежней версии сохранён на Диск (form_prev.docx)")
+            else:
+                print("[runner] ВНИМАНИЕ: бэкап прежней версии не сохранён — "
+                      "продолжаю загрузку без него")
+        except Exception as e:
+            print(f"[runner] ВНИМАНИЕ: бэкап не удался ({e}) — продолжаю загрузку")
+    if safe_upload(FORM_DISK_PATH, data, "загрузка формы", "application/octet-stream"):
+        print("[runner] Форма загружена на Диск и сверена (md5)")
+        return True
+    if prev:
+        print("[runner] Попытка откатить форму на прежнюю версию...")
+        if safe_upload(FORM_DISK_PATH, prev, "откат на бэкап",
+                       "application/octet-stream", tries=3, delay=10):
+            print("[runner] Откат выполнен: на Диске прежняя (рабочая) версия; "
+                  "запустите прогон ещё раз позже")
+            return False
+        print("[runner] ВНИМАНИЕ: откат не удался — проверьте файл на Диске вручную!")
+    return False
 
 
 def pick_mode(now=None):
@@ -151,19 +175,82 @@ def state_download(monday, workdir):
         return None
 
 
-def state_upload(local):
-    if not TOKEN:
-        return False
-    url = (f"{API}/resources/upload?path=" + urllib.parse.quote(STATE_PATH)
+def _md5(b):
+    return hashlib.md5(b).hexdigest()
+
+
+def _put_resource(path, data, ctype):
+    """Перезаписать ресурс на Диске одним PUT (overwrite=true)."""
+    url = (f"{API}/resources/upload?path=" + urllib.parse.quote(path)
            + "&overwrite=true")
     with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as rr:
         href = json.load(rr).get("href")
+    if not href:
+        raise RuntimeError("Диск не вернул ссылку для загрузки")
     req = urllib.request.Request(
-        href, data=open(local, "rb").read(), method="PUT",
-        headers={**UA, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as rr:
+        href, data=data, method="PUT",
+        headers={**UA, "Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=180) as rr:
         rr.read()
-    return True
+
+
+def _fetch_resource(path):
+    """Скачать ресурс с Диска целиком."""
+    url = (f"{API}/resources/download?path=" + urllib.parse.quote(path))
+    with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as rr:
+        href = json.load(rr).get("href")
+    with urllib.request.urlopen(urllib.request.Request(
+            href, headers={**UA}), timeout=120) as rr:
+        return rr.read()
+
+
+def _is_lock_error(e):
+    s = str(e).lower()
+    return ("lock" in s or "409" in s or "conflict" in s)
+
+
+def safe_upload(path, data, label, ctype, tries=5, delay=30):
+    """Загрузить данные на Диск с проверкой после записи.
+
+    Каждый шаг: PUT (overwrite=true) -> скачать обратно -> сверить md5.
+    Если файл залочен (открыт в редакторе) — повторить позже.
+    Если после записи файл оказался битым — повторить загрузку.
+    Вернуть True/False."""
+    want = _md5(data)
+    for i in range(1, tries + 1):
+        try:
+            _put_resource(path, data, ctype)
+        except Exception as e:
+            if _is_lock_error(e):
+                print(f"[runner] {label}: файл на Диске открыт в редакторе "
+                      f"(залочен); подождите и он освободится. Повтор {i}/{tries} через {delay} c")
+            else:
+                print(f"[runner] {label}: запись не удалась ({e}); повтор {i}/{tries} через {delay} c")
+            if i < tries:
+                time.sleep(delay)
+            continue
+        try:
+            got = _fetch_resource(path)
+            if _md5(got) == want:
+                return True
+            print(f"[runner] {label}: запись сверяется неверно (md5 расходится) — повтор {i}/{tries}")
+        except Exception as e:
+            print(f"[runner] {label}: не удалось проверить запись ({e}) — повтор {i}/{tries}")
+        if i < tries:
+            time.sleep(delay)
+    return False
+
+
+def state_upload(local):
+    if not TOKEN:
+        return False
+    with open(local, "rb") as f:
+        data = f.read()
+    ok = safe_upload(STATE_PATH, data, "загрузка снапшота",
+                     "application/json", tries=3, delay=20)
+    if ok:
+        print("[runner] Снапшот загружен и сверён (md5)")
+    return ok
 
 
 def run_mode(mode, monday, workdir):
@@ -189,13 +276,18 @@ def run_mode(mode, monday, workdir):
         cmd += ["--state", state]
     print("[runner] Этап 2/5: ЗАПУСК:", " ".join(cmd))
     rc = subprocess.call(cmd)
+    if rc == 3:
+        print("[runner] ШТАТНАЯ ОТМЕНА (защита данных): условия не подходят для этой операции. "
+              "Это не сбой — данные в целости, прогон завершён без изменений")
+        return "skipped"
     if rc != 0:
         print(f"[runner] Режим {mode} завершился с кодом {rc} — на Диск ничего не загружено")
         return "failed"
 
     print("[runner] Этап 3/5: загрузка снапшота")
     if mode in ("fill", "sync") and os.path.exists(state):
-        retry_call(lambda: state_upload(state), "загрузка снапшота")
+        if not retry_call(lambda: state_upload(state), "загрузка снапшота"):
+            raise RuntimeError("снапшот не загружен на Диск")
     with open(out, "rb") as f:
         new_data = f.read()
     if new_data == data:
@@ -209,7 +301,7 @@ def run_mode(mode, monday, workdir):
                   "Ничего не перезаписано — запустите ещё раз позже.")
             return "failed"
     print("[runner] Этап 5/5: загрузка формы")
-    return "uploaded" if retry_call(lambda: disk_upload(new_data), "загрузка формы") else "nochange"
+    return "uploaded" if disk_upload(new_data, data) else "failed"
 
 
 def main():
@@ -238,6 +330,8 @@ def main():
         print("[runner] ЗАВЕРШЕНО С ОШИБКОЙ — прогон помечен как упавший; "
               "изменения на Диск могли не попасть, запустите режим ещё раз")
         sys.exit(1)
+    if status == "skipped":
+        print("[runner] Прогон штатно отменён защитой данных — ошибки нет")
 
 
 if __name__ == "__main__":
