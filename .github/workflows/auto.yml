@@ -2,12 +2,11 @@ name: auto
 
 on:
   schedule:
-    - cron: "0 3 * * 4"     # Чт 03:00 UTC
-    - cron: "0 10 * * 4"    # Чт 10:00 UTC
-    - cron: "30 2 * * 5"    # Пт 02:30 UTC
-    - cron: "0 3 * * 5"     # Пт 03:00 UTC
-    - cron: "50 3 * * 5"    # Пт 03:50 UTC
-    - cron: "30 4 * * 5"    # Пт 04:30 UTC
+    - cron: "0 3 * * 4"     # Чт 10:00 КРС
+    - cron: "0 10 * * 4"    # Чт 17:00 КРС
+    - cron: "0 3 * * 5"     # Пт 10:00 КРС
+    - cron: "0 4 * * 5"     # Пт 11:00 КРС
+    - cron: "0 6 * * 5"     # Пт 13:00 КРС
   workflow_dispatch:
     inputs:
       mode:
