@@ -4,6 +4,8 @@
 
 v7.7 (06.11.2026): слитный текст события — заголовок и краткое продолжение
   склеиваются в один абзац; продолжение строится и для обновлённых событий в sync.
+v7.8 (06.11.2026): слитная ячейка с форматами через пробел; форматы от ИИ
+  (медианазвания «8 канал», «дела.ру» — как отдельные пункты); полировка ячеек удалена.
 v7.6 (06.11.2026): полировка ячеек с маркером «участия Губернатора» и
   нацпроектными строками — спецстроки вырезаются перед ИИ и восстанавливаются
   при записи (раньше такие ячейки всегда отклонялись защитой).
@@ -503,26 +505,32 @@ def write_event(cell, ev):
             set_run(r, 10, bold=True)
         cell.add_paragraph()
     p = cell.add_paragraph()
-    title_line = f"{ev['canon']}: {polish_text(ev['title'])}"
-    desc = (ev.get('desc') or '').strip()
-    if desc:
-        title_line = f"{title_line} {polish_text(desc)}"
-    lines = [title_line]
-    lines += [''] + [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f for f in ev['formats']]
-    add_lines(p, lines, size=10)
+    body = ev.get('llm_text')
+    if not body:
+        body = polish_text(ev['title'])
+        desc = (ev.get('desc') or '').strip()
+        if desc:
+            body = f"{body} {polish_text(desc)}"
+    fmts = [f for f in (ev.get('formats') or []) if f]
+    line = f"{ev['canon']}: {body}"
+    if fmts:
+        line = f"{line} " + " ".join(fmts)
+    add_lines(p, [line], size=10)
 
 
 def write_event_gov(cell, ev):
     """Событие графика губернатора в ячейку ГУБЕРНАТОР: название, описание,
     форматы (по умолчанию соцсети, пресс-релиз, СМИ)."""
     clear_cell(cell)
-    lines = [polish_text(ev['title'])]
-    if ev.get('desc'):
-        lines += ['', polish_text(ev['desc'])]
-    lines += [''] + [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f
-                     for f in ev.get('formats', [])]
+    body = polish_text(ev['title'])
+    desc = (ev.get('desc') or '').strip()
+    if desc:
+        body = f"{body} {polish_text(desc)}"
+    fmts = [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f
+            for f in ev.get('formats', []) if f]
+    line = body + (' ' + ' '.join(fmts) if fmts else '')
     p = cell.add_paragraph()
-    add_lines(p, lines, size=10)
+    add_lines(p, [line], size=10)
 
 
 def cell_text_norm(cell):
@@ -786,9 +794,9 @@ def cmd_fill(args):
             pass
 
     events, gov, total = collect_week_events(monday)
-    n_sum = llm_org_summaries(events)
+    n_sum = llm_org_polish(events)
     if llm_available():
-        print(f"[llm] краткие смыслы: {n_sum} из {len([e for e in events if e.get('desc')])} событий с описанием")
+        print(f"[llm] тексты и форматы: {n_sum} из {len(events)} событий недели")
     per_day = {}
     for e in events:
         per_day.setdefault(e['day'], []).append(e)
@@ -844,10 +852,7 @@ def cmd_fill(args):
     org_body = sections['ОРГАНЫ ВЛАСТИ']['body']
     gov_body = sections['ГУБЕРНАТОР']['body']
 
-    # LLM-редактура (если задан YC_API_KEY) — потом пересчитать sig
-    changes = llm_polish_cells(doc, sections)
-    for c in changes:
-        print("[llm]", c)
+    # сигнатуры после вставок строк
     for s in snapshot:
         body = gov_body if s.get('sec') == 'gov' else org_body
         s['sig'] = cell_text_norm(table.cell(body[s['k']], s['day']))
@@ -995,7 +1000,8 @@ def cmd_sync(args):
             if ct == s.get('sig'):
                 found = (ri, 'exact')
                 break
-            if target and target in ct:
+            if target and (target in ct
+                           or cell_contains_title(table.cell(ri, day), s['title'])):
                 found = (ri, 'contains')
         if found:
             ri, how = found
@@ -1009,7 +1015,7 @@ def cmd_sync(args):
     # --- перезапись изменившихся ---
     changed_org = [e for sk, e in changed if snap[sk].get('sec', 'org') == 'org']
     if changed_org:
-        llm_org_summaries(changed_org)
+        llm_org_polish(changed_org)
     for sk, e in changed:
         s = snap[sk]
         day, sec = s['day'], s.get('sec', 'org')
@@ -1034,7 +1040,7 @@ def cmd_sync(args):
 
     # --- добавление новых ---
     org_to_add = [fresh[k] for k in to_add if k[1] == 'org']
-    llm_org_summaries(org_to_add)
+    llm_org_polish(org_to_add)
     for k in to_add:
         e = fresh[k]
         day, sec = k[0], k[1]
@@ -1083,16 +1089,6 @@ def cmd_sync(args):
 
     # --- сохранение ---
     state['events'] = list(snap.values())
-    changes = llm_polish_cells(doc, sections)
-    if changes:
-        print("[llm]", *changes, sep='\n')
-        for s in state['events']:
-            day = s['day']
-            for ri in body_of(s.get('sec', 'org')):
-                ct = cell_text_norm(table.cell(ri, day))
-                if ct and s['title'].lower() in ct:
-                    s['sig'] = ct
-                    break
     doc.save(args.out)
     with open(args.state, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
@@ -1153,83 +1149,126 @@ def llm_call(prompt):
     return None
 
 
-SUMMARY_PROMPT_ONE = (
+EVENT_PROMPT = (
     "Ты редактор официального недельного плана освещения событий органов власти. "
-    "Ниже заголовок и описание события. Напиши ПРОДОЛЖЕНИЕ события: 1-2 предложения "
-    "только из фактов описания (кто, что, где/когда, цифры), которых нет в заголовке. "
-    "Ничего не выдумывай и не добавляй деталей, которых нет в описании. "
-    "Не повторяй заголовок и его формулировки — пиши только новое. "
-    "Не упоминай форматы освещения (пресс-релиз, соцсети, ТВ, радио и т.п.). "
-    "Начни с заглавной буквы. Если описание пустое или ничего не добавляет к заголовку — "
-    "ответь ПУСТО. Ответь только текстом продолжения, без кавычек, пояснений и разметки.")
+    "Даны заголовок и описание события. Ответь строго двумя строками.\n"
+    "1) ТЕКСТ: полный текст события одним абзацем. Начни с заголовка дословно "
+    "(можно исправить только орфографию и пунктуацию, не меняя слова), затем продолжи "
+    "1-2 предложениями из фактов описания (кто, что, где/когда, цифры), которых нет в "
+    "заголовке. Не повторяй заголовок и не выдумывай ничего. Если описание пустое или "
+    "ничего не добавляет — верни только заголовок.\n"
+    "2) ФОРМАТЫ: форматы освещения события через запятую. Если в тексте упомянуты "
+    "конкретные СМИ, каналы или площадки («8 канал», «дела.ру», «радио Россия», "
+    "«ТК Енисей») — включай их названия отдельными пунктами, не выясняя тип. "
+    "Стандартные форматы: пресс-релиз, соцсети, ТВ, радио, сми, статья, интервью. "
+    "Перечисляй ВСЕ указанные форматы. Если форматы в тексте не указаны — "
+    "напиши: пресс-релиз, соцсети.\n"
+    "Без пояснений, кавычек и разметки вокруг ответа.")
 
 
-def llm_polish_texts(texts):
-    if not texts or not llm_available():
-        return texts
-    SEP = "\n===\n"
-    prompt = ("Ты редактор официального текстового плана. "
-              "Исправь орфографию, грамматику и пунктуацию в каждом фрагменте. "
-              "Правила: не меняй смысл, названия, даты, числа и аббревиатуры "
-              "(МО, КМНС и т.п.); сохраняй кавычки «»; не добавляй новых предложений; "
-              "верни РОВНО столько же фрагментов, разделив их строкой '==='; "
-              "без пояснений и кавычек вокруг ответа.")
-    out = llm_call(prompt + "\n\n" + SEP.join(texts))
-    if out is None:
-        print("[llm] редактура не выполнена; остался правиловый polish_text")
-        return texts
-    parts = re.split(r'\n*={3,}\n*', out.strip())
-    if len(parts) != len(texts):
-        print(f"[llm] редактура не выполнена (фрагментов {len(parts)} != {len(texts)}); "
-              "остался правиловый polish_text")
-        return texts
-    junk = r'^[\s`*_#•-]+|[\s`*_#•-]+$'
-    return [re.sub(junk, '', p).strip() for p in parts]
+FMT_CANON = {
+    'пресс-релиз': 'пресс-релиз', 'пресс релиз': 'пресс-релиз', 'релиз': 'пресс-релиз',
+    'соцсети': 'соцсети', 'соц сети': 'соцсети', 'соц. сети': 'соцсети',
+    'социальные сети': 'соцсети', 'пост': 'соцсети',
+    'тв': 'ТВ', 'телевидение': 'ТВ', 'телеканал': 'ТВ', 'сюжет': 'ТВ', 'эфир': 'ТВ',
+    'радио': 'радио',
+    'сми': 'СМИ',
+    'интернет сми': 'интернет СМИ', 'интернет-сми': 'интернет СМИ',
+    'сетевое издание': 'интернет СМИ', 'сайт': 'интернет СМИ', 'сайте': 'интернет СМИ',
+    'на сайте': 'интернет СМИ', 'портал': 'интернет СМИ',
+    'интервью': 'интервью',
+    'статья': 'статья',
+}
 
 
-def _summary_one(event):
-    """Краткий смысл одного события через отдельный запрос ИИ. Вернуть текст или None."""
-    prompt = (SUMMARY_PROMPT_ONE + "\n\n"
-              f"ЗАГОЛОВОК: {event['canon']}: {event['title']}\n"
-              f"ОПИСАНИЕ: {event['desc']}")
+def _fmt_canon(tok):
+    t = re.sub(r'\s+', ' ', (tok or '').strip().strip('.,;:!«»"\'').strip())
+    if not t:
+        return None
+    low = t.lower().replace('ё', 'е')
+    return FMT_CANON.get(low, t)
+
+
+def _parse_llm_formats(raw):
+    """Разобрать список форматов из ответа ИИ. Список строк или None (сбой)."""
+    if not raw:
+        return None
+    raw = re.sub(r'`*_#«»"]+', ' ', raw).strip().strip('.?!')
+    toks = [x for x in re.split(r'[;,]|\bи\b', raw, flags=re.I) if x.strip()]
+    fmts, seen = [], set()
+    for t in toks:
+        c = _fmt_canon(t)
+        if not c or len(c) > 40:
+            return None
+        k = c.lower().replace('ё', 'е')
+        if k in seen:
+            continue
+        seen.add(k)
+        fmts.append(c)
+    return fmts[:8] if fmts else None
+
+
+def _word_overlap(a, b):
+    """Доля значимых слов a (len>3), встречающихся в строке b."""
+    wa = [w for w in re.split(r'\W+', (a or '').lower().replace('ё', 'е')) if len(w) > 3]
+    if not wa:
+        return 1.0
+    return sum(1 for w in wa if w in b) / len(wa)
+
+
+def _event_polish_one(event):
+    """Полный текст события (заголовок + продолжение) и форматы — одним запросом ИИ.
+    Вернуть (text, formats) или None (сбой — тогда правиловый fallback)."""
+    prompt = (EVENT_PROMPT + "\n\n"
+              f"ЗАГОЛОВОК: {event['title']}\n"
+              f"ОПИСАНИЕ: {(event['desc'] or '').strip() or '(нет)'}")
     out = llm_call(prompt)
     if out is None:
         return None
-    s = strip_format_segments(out.strip())
-    s = re.sub(r'^[\s"«»\'`*_#-]+', '', s).strip()
-    s = re.sub(r'[\s`*_#]+$', '', s).strip()
-    s = re.sub(r'\s+', ' ', s).strip()
-    if s and s[-1] not in '.!?…':
-        s += '.'
-    if not s:
-        return ''  # ИИ: описание ничего не добавляет к заголовку
-    nums = {int(x) for x in re.findall(r'\d+', (event['title'] + ' ' + event['desc']))}
-    got = {int(x) for x in re.findall(r'\d+', s)}
-    if not got.issubset(nums) or len(s) > max(2 * len(event['desc']), 200):
-        return None  # подозрительный ответ — исходное описание остаётся
-    return s
+    m_t = re.search(r'ТЕКСТ:\s*(.*?)(?=\n\s*ФОРМАТЫ:|\Z)', out, re.S | re.I)
+    m_f = re.search(r'ФОРМАТЫ:\s*(.*)$', out, re.S | re.I)
+    if not m_t:
+        return None
+    text = re.sub(r'\s+', ' ', m_t.group(1)).strip()
+    text = re.sub(r'^[\s`*_#«»"]+|[\s`*_#«»"]+$', '', text).strip()
+    if not text:
+        return None
+    fmts = _parse_llm_formats(m_f.group(1)) if m_f else None
+    # заголовок должен остаться в тексте (>=60% значимых слов) — иначе sync не найдёт ячейку
+    if _word_overlap(event['title'], text.lower().replace('ё', 'е')) < 0.6:
+        return None
+    # числа только из заголовка/описания
+    nums = {int(x) for x in re.findall(r'\d+', (event['title'] + ' ' + (event['desc'] or '')))}
+    if not {int(x) for x in re.findall(r'\d+', text)}.issubset(nums):
+        return None
+    if len(text) > len(event['title'] + ' ' + (event['desc'] or '')) + 80:
+        return None
+    if not fmts:
+        fmts = ['пресс-релиз', 'соцсети']
+    return text, fmts
 
 
-def llm_org_summaries(events):
-    """Краткие смыслы орг-событий через ИИ: по одному запросу на событие
-    (пачка '===' ненадёжна — модель сваливает всё в один текст).
-    Заменяет ev['desc'] на краткий смысл ('' = описания не будет).
-    Без ключа ИИ события не трогаются."""
-    targets = [e for e in events if e.get('desc')]
-    if not targets or not llm_available():
+def llm_org_polish(events):
+    """Текст и форматы орг-событий через ИИ: по одному запросу на событие.
+    Заполняет ev['llm_text'] и ev['formats']. Без ключа ИИ события не трогаются.
+    Возвращает число обработанных событий."""
+    if not events or not llm_available():
         return 0
     from concurrent.futures import ThreadPoolExecutor
-    n = 0
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(_summary_one, targets))
-    for e, res in zip(targets, results):
+        results = list(pool.map(_event_polish_one, events))
+    n, missed = 0, []
+    for e, res in zip(events, results):
         if res is None:
+            missed.append(e['canon'])
             continue
-        e['desc'] = res
+        text, fmts = res
+        text = strip_format_segments(text)  # на случай, если ИИ вписал форматы в текст
+        e['llm_text'] = text
+        e['formats'] = fmts
         n += 1
-    if n < len(targets):
-        missed = [e['canon'] for e, res in zip(targets, results) if res is None]
-        print("[llm] смысл не построен для: " + ", ".join(missed) + " — описания остаются полными")
+    if missed:
+        print("[llm] правила вместо ИИ для: " + ", ".join(dict.fromkeys(missed)))
     return n
 
 
@@ -1239,62 +1278,6 @@ from docx.shared import Pt  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
 
 SECTION_NAMES = [s.strip() for s in os.environ.get("SECTIONS", "").split(",") if s.strip()]
-
-
-def llm_polish_cells(doc, sections):
-    """ИИ-редактура заполненных ячеек: разделы ОРГАНЫ ВЛАСТИ и ГУБЕРНАТОР.
-    Форматные строки ячейки не трогает; подозрительные ответы отклоняет.
-    Спецстроки в начале ячейки (маркер участия Губернатора, строки нацпроектов/
-    госпрограмм) вырезаются перед ИИ и восстанавливаются при записи — иначе
-    проверка «ответ начинается с названия органа» всегда проваливалась."""
-    if not llm_available():
-        return []
-    table = doc.tables[0]
-    cells, texts = [], []
-    for sec in ('ОРГАНЫ ВЛАСТИ', 'ГУБЕРНАТОР'):
-        for ri in sections[sec]['body']:
-            for ci in range(7):
-                cell = table.cell(ri, ci)
-                lines = [l for l in cell.text.split('\n') if l.strip()]
-                special = []
-                while lines and (lines[0].strip() == GOV_MARKER
-                                 or lines[0].strip().startswith(('Нацпроект «', 'Госпрограмма «'))):
-                    special.append(lines.pop(0))
-                    if lines and not lines[0].strip():
-                        lines.pop(0)  # пустая строка-разделитель после спецстрок
-                fmt = []
-                while lines and lines[-1].strip().lower() in (
-                        'пресс-релиз', 'соцсети', 'тв', 'радио', 'интернет сми', 'сми',
-                        'интернет-сми'):
-                    fmt.insert(0, lines.pop())
-                content = '\n'.join(lines).strip()
-                if content:
-                    cells.append((cell, content, fmt, sec, special))
-                    texts.append(content)
-    if not texts:
-        return []
-    fixed = llm_polish_texts(texts)
-    changes = []
-    for (cell, old, fmt, sec, special), new in zip(cells, fixed):
-        if new and new.strip() != old.strip():
-            length_ok = len(old) * 0.5 <= len(new) <= len(old) * 2.0
-            starts_ok = re.match(r'^[А-ЯЁ]{2,}', new) if sec == 'ОРГАНЫ ВЛАСТИ' else True
-            if not length_ok or not starts_ok:
-                changes.append(f"  ? LLM-ответ отклонён "
-                               f"({'структура' if sec == 'ОРГАНЫ ВЛАСТИ' else 'длина'}): {old[:50]}...")
-                continue
-            lines = new.split('\n') + fmt
-            clear_cell(cell)
-            if special:
-                for sp in special:
-                    p = cell.add_paragraph()
-                    r = p.add_run(sp)
-                    set_run(r, 10, bold=True)
-                cell.add_paragraph()
-            p = cell.add_paragraph()
-            add_lines(p, lines, size=10)
-            changes.append(f"  ✎ LLM: {old[:40]}... → {new[:40]}...")
-    return changes
 
 
 
