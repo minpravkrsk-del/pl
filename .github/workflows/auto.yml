@@ -39,7 +39,7 @@ jobs:
           YC_API_KEY: ${{ secrets.YC_API_KEY }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
-          MODE="${{ inputs.mode }}"
+          MODE="$(echo "${{ inputs.mode }}" | xargs)"
           case "${{ github.event.schedule }}" in
             "0 3 * * 4")   MODE=prep ;;
             "0 10 * * 4")  MODE=fill ;;
