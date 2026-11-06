@@ -38,6 +38,7 @@ jobs:
           GOV_MARKER: ${{ secrets.GOV_MARKER }}
           YC_API_KEY: ${{ secrets.YC_API_KEY }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
           MODE="$(echo "${{ inputs.mode }}" | xargs)"
           case "${{ github.event.schedule }}" in
