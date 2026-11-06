@@ -1143,16 +1143,15 @@ def llm_call(prompt):
     return None
 
 
-SUMMARY_PROMPT = (
+SUMMARY_PROMPT_ONE = (
     "Ты редактор официального недельного плана освещения событий органов власти. "
-    "Ниже перечислены события: заголовок и описание. Для каждого события подготовь "
-    "краткий смысл: 1-2 предложения только из фактов описания (кто, что, где/когда, "
-    "цифры). Ничего не выдумывай и не добавляй деталей, которых нет в описании. "
-    "Не повторяй заголовок дословно — пиши только то, чего в заголовке нет. "
-    "Не упоминай форматы освещения (пресс-релиз, соцсети, ТВ, радио и т.п.). "
-    "Если описание пустое или ничего не добавляет к заголовку — верни пустую строку. "
-    "Верни РОВНО столько же фрагментов, сколько событий, разделив их строкой '==='; "
-    "без нумерации и пояснений.")
+    "Ниже заголовок и описание события. Напиши краткий смысл: 1-2 предложения только "
+    "из фактов описания (кто, что, где/когда, цифры). Ничего не выдумывай и не "
+    "добавляй деталей, которых нет в описании. Не повторяй заголовок дословно — "
+    "пиши только то, чего в заголовке нет. Не упоминай форматы освещения "
+    "(пресс-релиз, соцсети, ТВ, радио и т.п.). Если описание пустое или ничего не "
+    "добавляет к заголовку — ответь ПУСТО. Ответь только текстом смысла, без "
+    "кавычек, пояснений и разметки.")
 
 
 def llm_polish_texts(texts):
@@ -1174,46 +1173,54 @@ def llm_polish_texts(texts):
         print(f"[llm] редактура не выполнена (фрагментов {len(parts)} != {len(texts)}); "
               "остался правиловый polish_text")
         return texts
-    return [p.strip() for p in parts]
+    junk = r'^[\s`*_#•-]+|[\s`*_#•-]+$'
+    return [re.sub(junk, '', p).strip() for p in parts]
+
+
+def _summary_one(event):
+    """Краткий смысл одного события через отдельный запрос ИИ. Вернуть текст или None."""
+    prompt = (SUMMARY_PROMPT_ONE + "\n\n"
+              f"ЗАГОЛОВОК: {event['canon']}: {event['title']}\n"
+              f"ОПИСАНИЕ: {event['desc']}")
+    out = llm_call(prompt)
+    if out is None:
+        return None
+    s = strip_format_segments(out.strip())
+    s = re.sub(r'^[\s"«»\'`*_#-]+', '', s).strip()
+    s = re.sub(r'[\s`*_#]+$', '', s).strip()
+    s = re.sub(r'\s+', ' ', s).strip()
+    if s and s[-1] not in '.!?…':
+        s += '.'
+    if not s:
+        return ''  # ИИ: описание ничего не добавляет к заголовку
+    nums = {int(x) for x in re.findall(r'\d+', (event['title'] + ' ' + event['desc']))}
+    got = {int(x) for x in re.findall(r'\d+', s)}
+    if not got.issubset(nums) or len(s) > max(2 * len(event['desc']), 200):
+        return None  # подозрительный ответ — исходное описание остаётся
+    return s
 
 
 def llm_org_summaries(events):
-    """Краткие смыслы орг-событий через ИИ. Заменяет ev['desc'] на краткий смысл
-    ('' = в ячейке описания не будет). Без ключа ИИ события не трогаются."""
+    """Краткие смыслы орг-событий через ИИ: по одному запросу на событие
+    (пачка '===' ненадёжна — модель сваливает всё в один текст).
+    Заменяет ev['desc'] на краткий смысл ('' = описания не будет).
+    Без ключа ИИ события не трогаются."""
     targets = [e for e in events if e.get('desc')]
     if not targets or not llm_available():
         return 0
-    SEP = "\n===\n"
-    items = []
-    for i, e in enumerate(targets, 1):
-        items.append(f"{i}. ЗАГОЛОВОК: {e['canon']}: {e['title']}\nОПИСАНИЕ: {e['desc']}")
-    out = llm_call(SUMMARY_PROMPT + "\n\n" + SEP.join(items))
-    if out is None:
-        print("[llm] краткие смыслы не выполнены — в ячейках останутся полные описания")
-        return 0
-    parts = re.split(r'\n*={3,}\n*', out.strip())
-    if len(parts) != len(targets):
-        print(f"[llm] краткие смыслы не выполнены (фрагментов {len(parts)} != {len(targets)}); "
-              "описания остаются полными")
-        return 0
-    nums_ok = [{int(x) for x in re.findall(r'\d+', (e['title'] + ' ' + e['desc']))}
-               for e in targets]
+    from concurrent.futures import ThreadPoolExecutor
     n = 0
-    for e, raw, nums in zip(targets, parts, nums_ok):
-        s = strip_format_segments(raw.strip())
-        s = re.sub(r'\s+', ' ', s).strip()
-        if s and s[-1] not in '.!?…':
-            s += '.'
-        if s:
-            got_nums = {int(x) for x in re.findall(r'\d+', s)}
-            if not got_nums.issubset(nums) or len(s) > max(2 * len(e['desc']), 200):
-                continue  # подозрительный ответ — оставляем исходное описание
-            e['desc'] = s
-            n += 1
-        else:
-            e['desc'] = ''  # ИИ: описание ничего не добавляет к заголовку
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_summary_one, targets))
+    for e, res in zip(targets, results):
+        if res is None:
+            continue
+        e['desc'] = res
+        n += 1
+    if n < len(targets):
+        missed = [e['canon'] for e, res in zip(targets, results) if res is None]
+        print("[llm] смысл не построен для: " + ", ".join(missed) + " — описания остаются полными")
     return n
-
 
 
 # -------------------------------------------------------------------- DOCX ---
