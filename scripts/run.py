@@ -3,6 +3,8 @@
 """Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
 загружает результат и снапшот обратно.
 
+v2.5 (06.11.2026) — 404 при скачивании снапшота не ретраится
+  (после prep снапшота нет и это норма; экономит ~40 с на прогон).
 v2.4 (06.11.2026) — prep сам удаляет снапшот недели после успешной заливки
   формы: иначе следующий fill видит снапшот, переключается на sync и
   отказывается (ловушка «пустая таблица + снапшот»). Удаление идёт в Корзину
@@ -32,6 +34,7 @@ import sys
 import time
 import traceback
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -55,6 +58,11 @@ RETRIES = 3        # попыток на сетевую операцию
 RETRY_DELAY = 20   # секунд между попытками
 
 
+class _StateNotFound(Exception):
+    """Снапшот недели отсутствует на Диске (404) — норма после prep,
+    не ретраится."""
+
+
 def _req(url, token=None):
     h = dict(UA)
     if token:
@@ -68,7 +76,7 @@ def retry_call(fn, label, tries=RETRIES, delay=RETRY_DELAY):
         try:
             return fn()
         except Exception as e:
-            if i == tries:
+            if i == tries or isinstance(e, _StateNotFound):
                 raise
             print(f"[runner] {label}: попытка {i}/{tries} не удалась ({e}); повтор через {delay} c")
             time.sleep(delay)
@@ -165,8 +173,13 @@ def state_download(monday, workdir):
 
     def _get():
         url = (f"{API}/resources/download?path=" + urllib.parse.quote(STATE_PATH))
-        with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as rr:
-            href = json.load(rr)["href"]
+        try:
+            with urllib.request.urlopen(_req(url, TOKEN), timeout=30) as rr:
+                href = json.load(rr)["href"]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise _StateNotFound()
+            raise
         with urllib.request.urlopen(_req(href), timeout=60) as rr:
             data = rr.read()
         with open(local, "wb") as f:
@@ -175,6 +188,9 @@ def state_download(monday, workdir):
 
     try:
         return retry_call(_get, "скачивание снапшота")
+    except _StateNotFound:
+        print("[runner] Снапшот на Диске отсутствует (после prep это норма)")
+        return None
     except Exception:
         return None
 
