@@ -2,6 +2,11 @@
 """
 Инструмент автообновления недельной формы (v7.3).
 
+v7.7 (06.11.2026): слитный текст события — заголовок и краткое продолжение
+  склеиваются в один абзац; продолжение строится и для обновлённых событий в sync.
+v7.6 (06.11.2026): полировка ячеек с маркером «участия Губернатора» и
+  нацпроектными строками — спецстроки вырезаются перед ИИ и восстанавливаются
+  при записи (раньше такие ячейки всегда отклонялись защитой).
 v7.4 (05.11.2026): ИИ-краткие смыслы орг-событий (YC_API_KEY), полировка губернаторских
 ячеек через ИИ, распознавание теле/радио-выходов без указанных форматов, чистка
 дублей форматов из описаний.
@@ -498,9 +503,11 @@ def write_event(cell, ev):
             set_run(r, 10, bold=True)
         cell.add_paragraph()
     p = cell.add_paragraph()
-    lines = [f"{ev['canon']}: {polish_text(ev['title'])}"]
-    if ev.get('desc'):
-        lines += ['', polish_text(ev['desc'])]
+    title_line = f"{ev['canon']}: {polish_text(ev['title'])}"
+    desc = (ev.get('desc') or '').strip()
+    if desc:
+        title_line = f"{title_line} {polish_text(desc)}"
+    lines = [title_line]
     lines += [''] + [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f for f in ev['formats']]
     add_lines(p, lines, size=10)
 
@@ -1000,6 +1007,9 @@ def cmd_sync(args):
                           f"({'ГУБ' if sec == 'gov' else 'ОРГ'}): {s['canon']}: {s['title'][:70]} — проверьте вручную")
 
     # --- перезапись изменившихся ---
+    changed_org = [e for sk, e in changed if snap[sk].get('sec', 'org') == 'org']
+    if changed_org:
+        llm_org_summaries(changed_org)
     for sk, e in changed:
         s = snap[sk]
         day, sec = s['day'], s.get('sec', 'org')
@@ -1145,13 +1155,13 @@ def llm_call(prompt):
 
 SUMMARY_PROMPT_ONE = (
     "Ты редактор официального недельного плана освещения событий органов власти. "
-    "Ниже заголовок и описание события. Напиши краткий смысл: 1-2 предложения только "
-    "из фактов описания (кто, что, где/когда, цифры). Ничего не выдумывай и не "
-    "добавляй деталей, которых нет в описании. Не повторяй заголовок дословно — "
-    "пиши только то, чего в заголовке нет. Не упоминай форматы освещения "
-    "(пресс-релиз, соцсети, ТВ, радио и т.п.). Если описание пустое или ничего не "
-    "добавляет к заголовку — ответь ПУСТО. Ответь только текстом смысла, без "
-    "кавычек, пояснений и разметки.")
+    "Ниже заголовок и описание события. Напиши ПРОДОЛЖЕНИЕ события: 1-2 предложения "
+    "только из фактов описания (кто, что, где/когда, цифры), которых нет в заголовке. "
+    "Ничего не выдумывай и не добавляй деталей, которых нет в описании. "
+    "Не повторяй заголовок и его формулировки — пиши только новое. "
+    "Не упоминай форматы освещения (пресс-релиз, соцсети, ТВ, радио и т.п.). "
+    "Начни с заглавной буквы. Если описание пустое или ничего не добавляет к заголовку — "
+    "ответь ПУСТО. Ответь только текстом продолжения, без кавычек, пояснений и разметки.")
 
 
 def llm_polish_texts(texts):
@@ -1233,7 +1243,10 @@ SECTION_NAMES = [s.strip() for s in os.environ.get("SECTIONS", "").split(",") if
 
 def llm_polish_cells(doc, sections):
     """ИИ-редактура заполненных ячеек: разделы ОРГАНЫ ВЛАСТИ и ГУБЕРНАТОР.
-    Форматные строки ячейки не трогает; подозрительные ответы отклоняет."""
+    Форматные строки ячейки не трогает; подозрительные ответы отклоняет.
+    Спецстроки в начале ячейки (маркер участия Губернатора, строки нацпроектов/
+    госпрограмм) вырезаются перед ИИ и восстанавливаются при записи — иначе
+    проверка «ответ начинается с названия органа» всегда проваливалась."""
     if not llm_available():
         return []
     table = doc.tables[0]
@@ -1243,6 +1256,12 @@ def llm_polish_cells(doc, sections):
             for ci in range(7):
                 cell = table.cell(ri, ci)
                 lines = [l for l in cell.text.split('\n') if l.strip()]
+                special = []
+                while lines and (lines[0].strip() == GOV_MARKER
+                                 or lines[0].strip().startswith(('Нацпроект «', 'Госпрограмма «'))):
+                    special.append(lines.pop(0))
+                    if lines and not lines[0].strip():
+                        lines.pop(0)  # пустая строка-разделитель после спецстрок
                 fmt = []
                 while lines and lines[-1].strip().lower() in (
                         'пресс-релиз', 'соцсети', 'тв', 'радио', 'интернет сми', 'сми',
@@ -1250,13 +1269,13 @@ def llm_polish_cells(doc, sections):
                     fmt.insert(0, lines.pop())
                 content = '\n'.join(lines).strip()
                 if content:
-                    cells.append((cell, content, fmt, sec))
+                    cells.append((cell, content, fmt, sec, special))
                     texts.append(content)
     if not texts:
         return []
     fixed = llm_polish_texts(texts)
     changes = []
-    for (cell, old, fmt, sec), new in zip(cells, fixed):
+    for (cell, old, fmt, sec, special), new in zip(cells, fixed):
         if new and new.strip() != old.strip():
             length_ok = len(old) * 0.5 <= len(new) <= len(old) * 2.0
             starts_ok = re.match(r'^[А-ЯЁ]{2,}', new) if sec == 'ОРГАНЫ ВЛАСТИ' else True
@@ -1266,6 +1285,12 @@ def llm_polish_cells(doc, sections):
                 continue
             lines = new.split('\n') + fmt
             clear_cell(cell)
+            if special:
+                for sp in special:
+                    p = cell.add_paragraph()
+                    r = p.add_run(sp)
+                    set_run(r, 10, bold=True)
+                cell.add_paragraph()
             p = cell.add_paragraph()
             add_lines(p, lines, size=10)
             changes.append(f"  ✎ LLM: {old[:40]}... → {new[:40]}...")
