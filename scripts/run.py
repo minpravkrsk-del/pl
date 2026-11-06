@@ -3,6 +3,10 @@
 """Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
 загружает результат и снапшот обратно.
 
+v2.4 (06.11.2026) — prep сам удаляет снапшот недели после успешной заливки
+  формы: иначе следующий fill видит снапшот, переключается на sync и
+  отказывается (ловушка «пустая таблица + снапшот»). Удаление идёт в Корзину
+  Диска, повторяется с ретраями; при неудаче прогон помечается ошибкой.
 v2.3 (05.11.2026) — v2.2 + штатная отмена не помечается ошибкой:
   * перед перезаписью формы старая версия сохраняется на Диск (form_prev.docx);
   * после загрузки файл скачивается обратно и сверяется по md5;
@@ -253,6 +257,34 @@ def state_upload(local):
     return ok
 
 
+def state_delete(tries=3, delay=10):
+    """Удалить снапшот недели с Диска (перемещается в Корзину). Вернуть True/False."""
+    if not TOKEN:
+        print("[runner] TOKEN не задан — удаление снапшота пропущено (тестовый режим)")
+        return True
+    url = f"{API}/resources?path=" + urllib.parse.quote(STATE_PATH)
+    for i in range(1, tries + 1):
+        try:
+            req = urllib.request.Request(url, headers={**UA, "Authorization": "OAuth " + TOKEN},
+                                         method="DELETE")
+            with urllib.request.urlopen(req, timeout=30) as rr:
+                rr.read()
+            print("[runner] Снапшот недели удалён с Диска (state.json) — "
+                  "следующий fill сможет запуститься заново")
+            return True
+        except Exception as e:
+            if "404" in str(e):
+                print("[runner] Снапшот на Диске отсутствует — удалять нечего")
+                return True
+            print(f"[runner] удаление снапшота: попытка {i}/{tries} не удалась ({e})"
+                  + (f"; повтор через {delay} c" if i < tries else ""))
+            if i < tries:
+                time.sleep(delay)
+    print(f"[runner] ВНИМАНИЕ: снапшот НЕ удалён — следующий fill не пройдёт! "
+          f"Удалите {STATE_PATH} с Диска вручную")
+    return False
+
+
 def run_mode(mode, monday, workdir):
     """Вернуть статус: 'uploaded' | 'nochange' | 'failed'."""
     src = os.path.join(workdir, "form_current.docx")
@@ -301,7 +333,14 @@ def run_mode(mode, monday, workdir):
                   "Ничего не перезаписано — запустите ещё раз позже.")
             return "failed"
     print("[runner] Этап 5/5: загрузка формы")
-    return "uploaded" if disk_upload(new_data, data) else "failed"
+    ok = disk_upload(new_data, data)
+    if ok and mode == "prep":
+        # Prep затёр таблицу — снапшот недели устарел и блокирует следующий fill.
+        if not state_delete():
+            print("[runner] prep загрузил форму, но снапшот не удалён — "
+                  "прогон помечен как упавший, чтобы обратить внимание")
+            return "failed"
+    return "uploaded" if ok else "failed"
 
 
 def main():
