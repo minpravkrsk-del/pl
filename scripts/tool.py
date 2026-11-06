@@ -4,7 +4,11 @@
 
 v7.7 (06.11.2026): слитный текст события — заголовок и краткое продолжение
   склеиваются в один абзац; продолжение строится и для обновлённых событий в sync.
-v7.9 (06.11.2026): форматы освещения — ОТДЕЛЬНОЙ строкой под текстом (не в хвосте);
+v7.10 (06.11.2026): два коротких запроса на событие (продолжение отдельно — схема
+  v7.7, работала 17/17; форматы отдельно) — yandexgpt-lite не умеет в структурированный
+  ответ из двух полей («нет строки ПРОДОЛЖЕНИЕ» на всех 27 событиях в v7.9);
+  текст ячейки пишется ОТДЕЛЬНЫМИ АБЗАЦАМИ (переносы внутри абзаца схлопываются
+  в редакторе пользователя — «края.пресс-релиз»). v7.9 (06.11.2026): форматы освещения — ОТДЕЛЬНОЙ строкой под текстом (не в хвосте);
   ИИ снова пишет только ПРОДОЛЖЕНИЕ (yandexgpt-lite пересказывал заголовок и проваливал
   валидацию 26/27 событий в v7.8), плюс тем же запросом возвращает форматы; при отказе
   ИИ в лог печатается причина. v7.8 (06.11.2026): слитная ячейка с форматами через пробел; форматы от ИИ
@@ -518,10 +522,13 @@ def write_event(cell, ev):
         if desc:
             body = f"{body} {polish_text(desc)}"
     fmts = [f for f in (ev.get('formats') or []) if f]
-    lines = [f"{ev['canon']}: {body}"]
+    p.text = ''  # абзац создан выше — используем его для строки текста
+    r = p.add_run(f"{ev['canon']}: {body}")
+    set_run(r, 10)
     if fmts:
-        lines.append(' '.join(fmts))
-    add_lines(p, lines, size=10)
+        fp = cell.add_paragraph()
+        r = fp.add_run(' '.join(fmts))
+        set_run(r, 10)
 
 
 def write_event_gov(cell, ev):
@@ -534,11 +541,13 @@ def write_event_gov(cell, ev):
         body = f"{body} {polish_text(desc)}"
     fmts = [polish_text(f) if not re.fullmatch(r'[А-ЯЁа-яё /\-]+', f) else f
             for f in ev.get('formats', []) if f]
-    lines = [body]
-    if fmts:
-        lines.append(' '.join(fmts))
     p = cell.add_paragraph()
-    add_lines(p, lines, size=10)
+    r = p.add_run(body)
+    set_run(r, 10)
+    if fmts:
+        fp = cell.add_paragraph()
+        r = fp.add_run(' '.join(fmts))
+        set_run(r, 10)
 
 
 def cell_text_norm(cell):
@@ -1157,21 +1166,24 @@ def llm_call(prompt):
     return None
 
 
-EVENT_PROMPT = (
+SUMMARY_PROMPT_ONE = (
     "Ты редактор официального недельного плана освещения событий органов власти. "
-    "Даны заголовок и описание события. Ответь строго двумя строками.\n"
-    "1) ПРОДОЛЖЕНИЕ: 1-2 предложения только из фактов описания (кто, что, где/когда, "
-    "цифры), которых нет в заголовке. Не повторяй заголовок, ничего не выдумывай и не "
-    "упоминай форматы освещения (пресс-релиз, соцсети, ТВ и т.п.). Если описание пустое "
-    "или ничего не добавляет к заголовку — ответь ПУСТО.\n"
-    "2) ФОРМАТЫ: форматы освещения события через запятую. Если в тексте упомянуты "
-    "конкретные СМИ, каналы или площадки («8 канал», «дела.ру», «радио Россия», "
-    "«ТК Енисей») — включай их названия отдельными пунктами, не выясняя тип. "
-    "Стандартные форматы: пресс-релиз, соцсети, ТВ, радио, сми, статья, интервью. "
-    "Перечисляй ВСЕ указанные форматы. Если форматы в тексте не указаны — "
-    "напиши: пресс-релиз, соцсети.\n"
-    "Без пояснений, кавычек и разметки вокруг ответа.")
+    "Ниже заголовок и описание события. Напиши краткий смысл: 1-2 предложения только "
+    "из фактов описания (кто, что, где/когда, цифры). Ничего не выдумывай и не "
+    "добавляй деталей, которых нет в описании. Не повторяй заголовок дословно — "
+    "пиши только то, чего в заголовке нет. Не упоминай форматы освещения "
+    "(пресс-релиз, соцсети, ТВ, радио и т.п.). Если описание пустое или ничего не "
+    "добавляет к заголовку — ответь ПУСТО. Ответь только текстом смысла, без "
+    "кавычек, пояснений и разметки.")
 
+FORMATS_PROMPT = (
+    "Определи форматы освещения события по его заголовку и описанию. "
+    "Стандартные форматы: пресс-релиз, соцсети, ТВ, радио, сми, статья, интервью. "
+    "Если упомянуты конкретные СМИ, каналы или площадки («8 канал», «дела.ру», "
+    "«радио Россия», «ТК Енисей») — включай их названия как отдельные пункты, "
+    "не выясняя тип. Перечисляй ВСЕ указанные форматы. Если форматы не указаны — "
+    "напиши: пресс-релиз, соцсети. Ответь только списком через запятую, "
+    "без пояснений и разметки.")
 
 FMT_CANON = {
     'пресс-релиз': 'пресс-релиз', 'пресс релиз': 'пресс-релиз', 'релиз': 'пресс-релиз',
@@ -1215,60 +1227,76 @@ def _parse_llm_formats(raw):
     return fmts[:8] if fmts else None
 
 
-def _event_polish_one(event):
-    """Продолжение события и форматы — одним запросом ИИ. Вернуть (cont, formats)
-    или None (сбой — тогда правиловый fallback); причину отказа печатаем в лог."""
-    prompt = (EVENT_PROMPT + "\n\n"
+
+def _summary_one(event):
+    """Продолжение одного события отдельным запросом ИИ. Текст, '' (ПУСТО) или None."""
+    prompt = (SUMMARY_PROMPT_ONE + "\n\n"
+              f"ЗАГОЛОВОК: {event['title']}\n"
+              f"ОПИСАНИЕ: {event['desc']}")
+    out = llm_call(prompt)
+    if out is None:
+        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): запрос не удался")
+        return None
+    s = strip_format_segments(out.strip())
+    s = re.sub(r'^[\s"«»\'`*_#-]+', '', s).strip()
+    s = re.sub(r'[\s`*_#]+$', '', s).strip()
+    s = re.sub(r'\s+', ' ', s).strip()
+    if s and s[-1] not in '.!?…':
+        s += '.'
+    if not s or re.fullmatch(r'пусто', s.rstrip('.'), flags=re.I):
+        return ''
+    nums = {int(x) for x in re.findall(r'\d+', (event['title'] + ' ' + (event['desc'] or '')))}
+    got = {int(x) for x in re.findall(r'\d+', s)}
+    if not got.issubset(nums):
+        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл с выдуманными числами — правила")
+        return None
+    if len(s) > max(2 * len(event['desc'] or ''), 200):
+        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл слишком длинный — правила")
+        return None
+    return s
+
+
+def _formats_one(event):
+    """Форматы освещения одного события отдельным запросом ИИ. Список или None."""
+    prompt = (FORMATS_PROMPT + "\n\n"
               f"ЗАГОЛОВОК: {event['title']}\n"
               f"ОПИСАНИЕ: {(event['desc'] or '').strip() or '(нет)'}")
     out = llm_call(prompt)
     if out is None:
         return None
-    m_c = re.search(r'ПРОДОЛЖЕНИЕ:\s*(.*?)(?=\n\s*ФОРМАТЫ:|\Z)', out, re.S | re.I)
-    m_f = re.search(r'ФОРМАТЫ:\s*(.*)$', out, re.S | re.I)
-    if not m_c:
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): нет строки ПРОДОЛЖЕНИЕ — правила")
-        return None
-    cont = re.sub(r'\s+', ' ', m_c.group(1)).strip()
-    cont = re.sub(r'^[\s`*_#«»"]+|[\s`*_#«»"]+$', '', cont).strip()
-    if re.fullmatch(r'(пусто|нет|-|—)?', cont, flags=re.I):
-        cont = ''
-    if cont:
-        # числа только из заголовка/описания
-        nums = {int(x) for x in re.findall(r'\d+', (event['title'] + ' ' + (event['desc'] or '')))}
-        if not {int(x) for x in re.findall(r'\d+', cont)}.issubset(nums):
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): выдуманные числа — правила")
-            return None
-        if len(cont) > max(2 * len(event['desc'] or ''), 200):
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): продолжение слишком длинное — правила")
-            return None
-    fmts = _parse_llm_formats(m_f.group(1)) if m_f else ['пресс-релиз', 'соцсети']
-    if not fmts:
-        fmts = ['пресс-релиз', 'соцсети']
-    return cont, fmts
+    out = out.strip()
+    m = re.match(r'^[^:,;]{1,40}:', out)  # срезать префикс вида «Форматы:», «Ответ:»
+    if m:
+        out = out[m.end():].strip()
+    fmts = _parse_llm_formats(out)
+    if fmts is None:
+        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): форматы не распознаны — правила")
+    return fmts
 
 
 def llm_org_polish(events):
-    """Продолжения и форматы орг-событий через ИИ: по одному запросу на событие.
-    Заполняет ev['llm_cont'] и ev['formats']. Без ключа ИИ события не трогаются.
-    Возвращает число обработанных событий."""
+    """Продолжения и форматы орг-событий через ИИ: по два коротких запроса на событие
+    (yandexgpt-lite не держит структурированные ответы из двух полей).
+    Заполняет ev['llm_cont'] (если построен) и ev['formats'] (если распознаны).
+    Без ключа ИИ события не трогаются. Возвращает число событий с готовым текстом."""
     if not events or not llm_available():
         return 0
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(_event_polish_one, events))
+        conts = list(pool.map(_summary_one, events))
+        fmts = list(pool.map(_formats_one, events))
     n, missed = 0, []
-    for e, res in zip(events, results):
-        if res is None:
+    for e, cont, fmt in zip(events, conts, fmts):
+        if cont is not None:
+            e['llm_cont'] = cont
+        if fmt is not None:
+            e['formats'] = fmt
+        if cont is None:
             missed.append(e['canon'])
-            continue
-        cont, fmts = res
-        cont = strip_format_segments(cont)  # на случай, если ИИ вписал форматы в продолжение
-        e['llm_cont'] = cont
-        e['formats'] = fmts
-        n += 1
+        else:
+            n += 1
     if missed:
-        print("[llm] правила вместо ИИ для: " + ", ".join(dict.fromkeys(missed)))
+        print("[llm] правила вместо ИИ (текст) для: " + ", ".join(dict.fromkeys(missed)))
     return n
 
 
