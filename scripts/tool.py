@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Инструмент автообновления недельной формы (v7.3).
+Инструмент автообновления недельной формы (v7.25).
+
+v7.25 (06.11.2026): новая схема ИИ-текста — один запрос на событие по промту
+  «1) сократи, сохранив факты; 2) сравни с заголовком; 3) убери повторы».
+  Перезапросы, правиловый фолбэк, стоп-листы штампов и проверка новизны убраны.
+  Осталось: отсечка предложений-повторов (пересказ: доля слов предложения,
+  покрытие заголовка, дословное вхождение заголовка), пустышек вида
+  «Мероприятие.», проверка чисел против источника (чужое число — предложение
+  опускается), лимит 350 знаков; при сбое запроса — ячейка из одного заголовка.
+  Путь без ИИ-ключа прежний (заголовок + полное описание).
 
 v7.7 (06.11.2026): слитный текст события — заголовок и краткое продолжение
   склеиваются в один абзац; продолжение строится и для обновлённых событий в sync.
@@ -1254,16 +1263,23 @@ def llm_call(prompt):
     return None
 
 
-SUMMARY_PROMPT_ONE = (
-    "Ты редактор официального недельного плана освещения событий органов власти. "
-    "Ниже заголовок и описание события. Напиши продолжение: 1-2 коротких предложения "
-    "только из фактов описания (кто, что, где/когда, цифры), которых нет в заголовке. "
-    "Ничего не выдумывай и не добавляй деталей, которых нет в описании. НЕ повторяй "
-    "из заголовка перечисления организаций и учреждений, даты, имена — они уже названы, "
-    "упоминай их один раз. Если описание только пересказывает заголовок другими словами "
-    "или не добавляет ничего нового — ответь ПУСТО. Не упоминай форматы освещения "
-    "(пресс-релиз, соцсети, ТВ, радио и т.п.). Ответь только текстом, без кавычек, "
-    "пояснений и разметки.")
+SHORTEN_PROMPT = (
+    "Ты редактор официального недельного плана освещения событий органов власти.\n\n"
+    "Текст:\n{TEXT}\n\n"
+    "Заголовок:\n{TITLE}\n\n"
+    "1. Сократи этот текст, сохранив все факты: кто, что, где, когда, цифры.\n"
+    "2. Сравни свой текст с заголовком.\n"
+    "3. Убери из него всё, что дословно или по смыслу повторяет заголовок, — "
+    "не выбрасывай новые факты, даже если тема совпадает.\n\n"
+    "Не упоминай форматы освещения (пресс-релиз, соцсети, ТВ, радио). "
+    "Ответ — только итоговый текст, без кавычек, пояснений и разметки.")
+
+SHORTEN_MAX_CHARS = 350
+
+REFUSAL_RE = re.compile(
+    r'не могу (обсуждать|обсудить|помочь|ответить|составить|написать)'
+    r'|не имею возможности|поговорим о ч|не в моей компетенции|давайте поговорим', re.I)
+
 
 FORMATS_PROMPT = (
     "Определи форматы освещения события по его заголовку и описанию. "
@@ -1276,114 +1292,31 @@ FORMATS_PROMPT = (
     "пресс-релиз, соцсети. Ответь только списком через запятую, "
     "без пояснений и разметки.")
 
-FMT_CANON = {
-    'пресс-релиз': 'пресс-релиз', 'пресс релиз': 'пресс-релиз', 'релиз': 'пресс-релиз',
-    'соцсети': 'соцсети', 'соц сети': 'соцсети', 'соц. сети': 'соцсети',
-    'социальные сети': 'соцсети', 'пост': 'соцсети',
-    'тв': 'ТВ', 'телевидение': 'ТВ', 'телеканал': 'ТВ', 'сюжет': 'ТВ', 'эфир': 'ТВ',
-    'радио': 'радио',
-    'сми': 'СМИ',
-    'интернет сми': 'интернет СМИ', 'интернет-сми': 'интернет СМИ',
-    'сетевое издание': 'интернет СМИ', 'сайт': 'интернет СМИ', 'сайте': 'интернет СМИ',
-    'на сайте': 'интернет СМИ', 'портал': 'интернет СМИ',
-    'интервью': 'интервью',
-    'статья': 'статья',
-}
+def _split_sentences(s):
+    parts = re.split(r'(?<=[.!?…])\s+', s.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
-def _fmt_canon(tok):
-    t = re.sub(r'\s+', ' ', (tok or '').strip().strip('.,;:!«»"\'').strip())
-    if not t:
-        return None
-    low = t.lower().replace('ё', 'е')
-    return FMT_CANON.get(low, t)
+def _stems5(text):
+    return {w[:5] for w in re.split(r'\W+', (text or '').lower().replace('ё', 'е')) if len(w) > 3}
 
 
-def _parse_llm_formats(raw):
-    """Разобрать список форматов из ответа ИИ. Список строк или None (сбой).
-    Токены с кавычками и длиннее двух слов отсекаются — это названия передач
-    и болтовня, а не форматы («программа „Наше здоровье“»)."""
-    if not raw:
-        return None
-    toks = [x for x in re.split(r'[;,]|\bи\b', raw.strip().strip('.?!'), flags=re.I) if x.strip()]
-    fmts, seen = [], set()
-    for t in toks:
-        if re.search(r'[«»"]', t) or len(t.split()) > 2:
-            continue
-        c = _fmt_canon(t)
-        if not c or len(c) > 40:
-            return None
-        k = c.lower().replace('ё', 'е')
-        if k in seen:
-            continue
-        seen.add(k)
-        fmts.append(c)
-    return fmts[:8] if fmts else None
+def _norm_phrase(s):
+    return re.sub(r'\s+', ' ', re.sub(r'[«»".,!?();:\-—–]+', ' ', (s or '').lower().replace('ё', 'е'))).strip()
 
 
-
-REFUSAL_RE = re.compile(
-    r'не могу (обсуждать|обсудить|помочь|ответить|составить|написать)'
-    r'|не имею возможности|поговорим о ч|не в моей компетенции|давайте поговорим', re.I)
-
-# Штампы PR-языка и служебные слова: их использование в продолжении НЕ является
-# выдумкой (в отличие от реальных фактов — «тонны», «выбросов», «диагностика»),
-# поэтому в проверке новизны они не считаются словами вне источника.
-GENERIC_STEMS = {x[:5] for x in (
-    'принял', 'принятые', 'принимает', 'участие', 'состоялось', 'запланировано',
-    'пройдет', 'проведен', 'организован', 'встреча', 'обсуждаются', 'рассказали',
-    'сообщили', 'выступил', 'специалисты', 'представили', 'результаты', 'отметив',
-    'подчеркнули', 'оптимизировать', 'внедрение', 'ожидается', 'смогли', 'своих',
-    'различные', 'актуальные', 'вопросы', 'мероприятия', 'посетил', 'перед',
-    'между', 'около', 'после', 'также', 'снова', 'который', 'таких', 'этого',
-)}
-
-MONTH_STEMS = ('январ', 'феврал', 'март', 'апрел', 'мая', 'мае', 'май',
-               'июн', 'июл', 'август', 'сентябр', 'октябр', 'ноябр', 'декабр')
-
-_NUM_MON = {1: 'январ', 2: 'феврал', 3: 'март', 4: 'апрел', 5: 'мая', 6: 'июн',
-            7: 'июл', 8: 'август', 9: 'сентябр', 10: 'октябр', 11: 'ноябр', 12: 'декабр'}
-
-
-def _month_of(word):
-    """Основа месяца для слова или None."""
-    for st in MONTH_STEMS:
-        if word.startswith(st):
-            return st
-    return None
-
-
-def _date_pairs(text):
-    """Пары (основа месяца, кортеж чисел при нём) из текста.
-    Ловит «2–3 декабря», «с 9 по 11 ноября», «11 ноября»."""
-    t = text.lower().replace('ё', 'е')
-    pairs = set()
-    for m in re.finditer(r'(\d+)(?:\s*[-\u2013\u2014]\s*(\d+))?\s*(?:по\s*(\d+)\s*)?(\w+)', t):
-        mon = _month_of(m.group(4))
-        if not mon:
-            continue
-        nums = [int(m.group(1))]
-        if m.group(2):
-            nums.append(int(m.group(2)))
-        if m.group(3):
-            nums.append(int(m.group(3)))
-        pairs.add((mon, tuple(sorted(nums))))
-    # числовые даты: «09 – 11.11.2026» — диапазон объединяет оба числа у общего месяца
-    for m in re.finditer(r'(\d{1,2})\s*[-\u2013\u2014]\s*(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?', t):
-        mon = _NUM_MON.get(int(m.group(3)))
-        if mon:
-            pairs.add((mon, tuple(sorted({int(m.group(1)), int(m.group(2))}))))
-    # одиночная числовая дата: «11.11.2026», «05.10»
-    for m in re.finditer(r'(?<![\d.])(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?(?![\d.])', t):
-        mon = _NUM_MON.get(int(m.group(2)))
-        if mon:
-            pairs.add((mon, (int(m.group(1)),)))
-    return pairs
+def _title_stem_overlap(sent, title):
+    """Доля основ слов предложения, совпадающих с заголовком (0..1)."""
+    q = _stems5(sent)
+    t = _stems5(title)
+    if not q:
+        return 0.0
+    return len(q & t) / len(q)
 
 
 FUNC_TAIL = {'в', 'во', 'на', 'о', 'об', 'обо', 'к', 'ко', 'с', 'со', 'для', 'по', 'про',
              'из', 'от', 'до', 'у', 'за', 'при', 'и', 'а', 'но', 'или', 'что', 'как',
-             'это', 'же', 'не', 'ни', 'без', 'над', 'под', 'их', 'их'}
+             'это', 'же', 'не', 'ни', 'без', 'над', 'под', 'их'}
 
 
 def _trim_dangling_tail(s):
@@ -1396,143 +1329,78 @@ def _trim_dangling_tail(s):
         m = re.match(r'^(.*?[.!?…])\s*(.*)$', core, flags=re.S)
         tail = m.group(2).strip() if m else core
         words = [w for w in re.split(r'\W+', tail.lower()) if w]
-        if not words:
-            r = core.strip()
-            if r and punct and r[-1] not in '.!?…':
-                r += punct
-            return r
-        if words[-1] in FUNC_TAIL:
-            if not m:
-                return ''
-            core = m.group(1).strip()
-            if not core:
-                return ''
+        if words and words[-1] in FUNC_TAIL:
+            tail_pos = core.rfind(tail)
+            core = core[:tail_pos].rstrip(' .,;:-—–«»()')
             continue
-        r = core.strip()
-        if r and punct and r[-1] not in '.!?…':
-            r += punct
-        return r
-
-
-def _date_distortion(s, source):
-    """Список искажённых дат: пары, которых нет в источнике, либо месяцы вне источника."""
-    bad = list(_date_pairs(s) - _date_pairs(source))
-    src_mon = {st for st in (_month_of(w) for w in re.split(r'\W+', source.lower().replace('ё', 'е'))) if st}
-    for w in re.split(r'\W+', s.lower().replace('ё', 'е')):
-        st = _month_of(w)
-        if st and src_mon and st not in src_mon:
-            bad.append((st, 'месяц вне источника'))
-    return bad
-
-
-def _desc_has_content(event):
-    """Есть ли в описании конкретика сверх заголовка (хотя бы одна значимая основа,
-    которой нет в заголовке). Описание сначала чистится от токенов форматов: остаток
-    «пресс-релиз» конкретикой не считается. Если конкретика есть — при отказе ИИ лучше
-    уйти в правила (полное описание), чем потерять содержимое в ячейке-заголовке."""
-    d = clean_desc(event['desc'] or '')
-    if not d:
-        return False
-    t_stems = {w[:5] for w in re.split(r'\W+', event['title'].lower().replace('ё', 'е')) if len(w) > 4}
-    for w in re.split(r'\W+', d.lower().replace('ё', 'е')):
-        if len(w) > 4 and w[:5] not in t_stems:
-            return True
-    return False
+        break
+    out = (core + punct).strip()
+    return out
 
 
 def _summary_one(event, draft=None):
-    """Продолжение одного события отдельным запросом ИИ. Текст, '' (ПУСТО) или None.
-    draft — черновик, дублировавший заголовок: отправляется на перезапрос."""
-    prompt = (SUMMARY_PROMPT_ONE + "\n\n"
-              f"ЗАГОЛОВОК: {event['title']}\n"
-              f"ОПИСАНИЕ: {event['desc']}\n\n"
-              "ВАЖНО О ЦИФРАХ И ДАТАХ: воспроизводи их точно как в источнике, не сокращай "
-              "диапазоны (если в источнике «с 9 по 11 ноября» — так и пиши), не меняй числа "
-              "и месяцы местами. Не выбрасывай даты, цифры и конкретику (кто, где, когда, "
-              "сколько): выкидывать можно только «воду» и пересказ заголовка. Если не уверен "
-              "в дате — лучше опусти её вовсе.")
-    if draft:
-        prompt += ("\n\nПРЕДУПРЕЖДЕНИЕ: твой предыдущий ответ повторял заголовок или содержал сведения, которых нет в описании:\n"
-                   + draft +
-                   "\nПерепиши: только факты из заголовка и описания, ничего нового не придумывай, только причёсывай имеющееся. "
-                   "Не начинай с пересказа заголовка. Если добавить нечего — ответь ПУСТО.")
+    """Сокращение описания одним запросом ИИ (схема «сократи — сравни — убери повторы»).
+    Возвращает итоговый текст продолжения или '' (нечего добавить / сбой запроса).
+    Никаких перезапросов и правилового фолбэка: заголовок важнее, остальное опускаем."""
+    desc = (event.get('desc') or '').strip()
+    text = event['title'] + (('. ' + desc) if desc else '')
+    prompt = SHORTEN_PROMPT.replace('{TEXT}', text).replace('{TITLE}', event['title'])
     out = llm_call(prompt)
     if out is None:
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): запрос не удался")
-        return None
+        return ''
     s = strip_format_segments(out.strip())
     s = re.sub(r'^[\s"«»\'`*_#-]+', '', s).strip()
     s = re.sub(r'[\s`*_#]+$', '', s).strip()
     s = re.sub(r'\s+', ' ', s).strip()
-    s = _trim_dangling_tail(s)  # обрубки вида «Посты в» не допускаются (до добавления точки)
+    s = _trim_dangling_tail(s)
     if not s or re.fullmatch(r'пусто', s.rstrip('.'), flags=re.I):
         return ''
-    if s and s[-1] not in '.!?…':
-        s += '.'
     if REFUSAL_RE.search(s):
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): модель отказалась — текст по правилам")
-        return None
-    src_num_text = event['title'] + ' ' + (event['desc'] or '')
-    nums = {int(x) for x in re.findall(r'\d+', src_num_text)}
-    my = re.match(r'(\d{4})-', str(event.get('start') or ''))
-    if my:
-        nums.add(int(my.group(1)))  # год события — законная цифра
-    got = {int(x) for x in re.findall(r'\d+', s)}
-    if not got.issubset(nums):
-        extra = sorted(got - nums)
-        if draft is None:
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): числа вне источника ({', '.join(map(str, extra[:4]))}) — перезапрос")
-            return _summary_one(event, draft=s)
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): числа вне источника ({', '.join(map(str, extra[:4]))}) — правила")
-        return None
-    # целостность дат: месяц+числа как пара, точно; диапазоны не сокращать
-    bad_dates = _date_distortion(s, event['title'] + ' ' + (event['desc'] or ''))
-    if bad_dates:
-        if draft is None:
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): искажены даты ({'; '.join(map(str, bad_dates[:2]))}) — перезапрос")
-            return _summary_one(event, draft=s)
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): даты снова искажены — правила")
-        return None
-    if len(s) > max(2 * len(event['desc'] or ''), 200):
-        print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл слишком длинный — правила")
-        return None
-    # «ничего не придумывать»: продолжение может опираться только на слова
-    # заголовка и описания. Два и более значимых слов-основ вне источника —
-    # выдумка или пересказ своими словами: перезапрос, при повторе — без продолжения.
-    src_all = event['title'] + ' ' + (event['desc'] or '')
-    src_stems = {w[:5] for w in re.split(r'\W+', src_all.lower().replace('ё', 'е')) if len(w) > 4}
-    # месяца из числовых дат («11.11.2026») можно называть словом («ноября») — это не выдумка
-    src_stems |= {m for m, _ in _date_pairs(src_all)}
-    if src_stems:
-        novel = [w for w in re.split(r'\W+', s.lower().replace('ё', 'е'))
-                 if len(w) > 4 and w[:5] not in src_stems
-                 and w[:5] not in GENERIC_STEMS]
-        if len(novel) >= 2:
-            if draft is None:
-                print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): в продолжении слова вне источника ({', '.join(novel[:3])}) — перезапрос «только из описания»")
-                return _summary_one(event, draft=s)
-            if _desc_has_content(event):
-                print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): в продолжении снова слова вне источника — в описании конкретика: правила")
-                return None
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): в продолжении снова слова вне источника — без продолжения")
-            return '' 
-    # пересказ заголовка другими словами — продолжение не нужно.
-    # Сравниваем по 5-буквенным основам, чтобы ловить словоформы
-    # («министр/министра», «депутами/депутатами»).
-    wa = {w[:5] for w in re.split(r'\W+', event['title'].lower().replace('ё', 'е')) if len(w) > 3}
-    cont_stems = [w[:5] for w in re.split(r'\W+', s.lower().replace('ё', 'е'))
-                  if len(w) > 4 and w[:5] not in GENERIC_STEMS]
-    if wa and cont_stems and sum(1 for st in cont_stems if st in wa) / len(cont_stems) >= 0.5:
-            if draft is None:
-                print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл дублирует заголовок — перезапрос «только новое»")
-                return _summary_one(event, draft=s)
-            if _desc_has_content(event):
-                print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл снова дублирует заголовок — в описании конкретика: правила")
-                return None
-            print(f"[llm] {event.get('canon', '?')} ({(event['title'] or '')[:40]}...): смысл снова дублирует заголовок — без продолжения")
-            return ''
-    return s
-
+        return ''
+    t_stems = _stems5(event['title'])
+    norm_title = _norm_phrase(event['title'])
+    nums = {int(x) for x in re.findall(r'\d+', event['title'] + ' ' + desc)}
+    kept, cut_dupes, cut_nums = [], 0, 0
+    for sent in _split_sentences(s):
+        q_stems = _stems5(sent)
+        if len(q_stems) < 2:
+            cut_dupes += 1
+            continue
+        if t_stems and q_stems:
+            share = len(q_stems & t_stems) / len(q_stems)
+            cover = len(q_stems & t_stems) / len(t_stems)
+        else:
+            share, cover = 0.0, 0.0
+        verbatim = len(norm_title) > 8 and norm_title in _norm_phrase(sent)
+        if share > 0.5 or (cover >= 0.9 and len(q_stems - t_stems) <= 5) or verbatim:
+            cut_dupes += 1
+            continue
+        got = {int(x) for x in re.findall(r'\d+', sent)}
+        if not got.issubset(nums):
+            extra = sorted(got - nums)
+            print("[llm] %s (%s...): числа вне источника (%s) — предложение опущено"
+                  % (event.get('canon', '?'), event['title'][:40], ', '.join(map(str, extra[:4]))))
+            cut_nums += 1
+            continue
+        kept.append(sent)
+    if not kept:
+        return ''
+    total = ' '.join(kept)
+    if total and total[-1] not in '.!?…':
+        total += '.'
+    if len(total) > SHORTEN_MAX_CHARS:
+        acc = ''
+        for sent in kept:
+            if acc and len(acc) + 1 + len(sent) > SHORTEN_MAX_CHARS:
+                break
+            acc = (acc + ' ' + sent).strip()
+        total = acc
+        if total and total[-1] not in '.!?…':
+            total += '.'
+    if cut_dupes or cut_nums:
+        print("[llm] %s (%s...): убрано пустых и повторов: %d, с чужими числами: %d"
+              % (event.get('canon', '?'), event['title'][:40], cut_dupes, cut_nums))
+    return total
 
 def _formats_one(event):
     """Форматы освещения одного события отдельным запросом ИИ. Список или None."""
@@ -1553,9 +1421,9 @@ def _formats_one(event):
 
 
 def llm_org_polish(events):
-    """Продолжения и форматы орг-событий через ИИ: по два коротких запроса на событие
-    (yandexgpt-lite не держит структурированные ответы из двух полей).
-    Заполняет ev['llm_cont'] (если построен) и ev['formats'] (если распознаны).
+    """Сокращённые тексты и форматы орг-событий через ИИ: два коротких запроса
+    на событие (схема «сократи — сравни — убери повторы»).
+    Заполняет ev['llm_cont'] (всегда: строка или '') и ev['formats'] (если распознаны).
     Без ключа ИИ события не трогаются. Возвращает число событий с готовым текстом."""
     if not events or not llm_available():
         return 0
@@ -1563,20 +1431,15 @@ def llm_org_polish(events):
     with ThreadPoolExecutor(max_workers=4) as pool:
         conts = list(pool.map(_summary_one, events))
         fmts = list(pool.map(_formats_one, events))
-    n, missed = 0, []
+    n = 0
     for e, cont, fmt in zip(events, conts, fmts):
-        if cont is not None:
-            e['llm_cont'] = cont
+        e['llm_cont'] = cont or ''
+        if cont:
+            n += 1
         if fmt is not None:
-            # форматы ИИ дополняют правиловые, но не заменяют их (нельзя терять «СМИ»/«соцсети»)
             base = list(dict.fromkeys(e.get('formats') or []))
             e['formats'] = base + [f for f in fmt if f not in base]
-        if cont is None:
-            missed.append(e['canon'])
-        else:
-            n += 1
-    if missed:
-        print("[llm] правила вместо ИИ (текст) для: " + ", ".join(dict.fromkeys(missed)))
+    print("[llm] тексты и форматы: %d из %d (схема: сократи/убери повторы)" % (n, len(events)))
     return n
 
 
