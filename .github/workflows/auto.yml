@@ -1,3 +1,5 @@
+# auto_v9.yml — v8 + два дополнительных пятничных sync-крона (12:00 и 14:00 КРС),
+# чтобы sync долечивал форму, когда в веб-редакторе Диска отпускается блокировка.
 name: auto
 
 on:
@@ -6,7 +8,9 @@ on:
     - cron: "0 10 * * 4"    # Чт 17:00 КРС — fill (заполнение)
     - cron: "0 3 * * 5"     # Пт 10:00 КРС — sync
     - cron: "0 4 * * 5"     # Пт 11:00 КРС — sync
+    - cron: "0 5 * * 5"     # Пт 12:00 КРС — sync (повтор при локе)
     - cron: "0 6 * * 5"     # Пт 13:00 КРС — sync
+    - cron: "0 7 * * 5"     # Пт 14:00 КРС — sync (повтор при локе)
   workflow_dispatch:
     inputs:
       mode:
@@ -46,7 +50,9 @@ jobs:
             "0 10 * * 4")  MODE=fill ;;
             "0 3 * * 5")   MODE=sync ;;
             "0 4 * * 5")   MODE=sync ;;
+            "0 5 * * 5")   MODE=sync ;;
             "0 6 * * 5")   MODE=sync ;;
+            "0 7 * * 5")   MODE=sync ;;
           esac
           echo "Режим запуска: $MODE"
           python scripts/run.py "$MODE"
