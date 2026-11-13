@@ -3,6 +3,13 @@
 """Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
 загружает результат и снапшот обратно.
 
+v2.7 (13.11.2026) — снапшот загружается ПОСЛЕ успешной записи формы и
+  только если форма записалась. При сбое записи (файл залочен в редакторе,
+  форму правили во время работы) снапшот остаётся в прежнем состоянии и
+  повторный прогон безопасно повторяет всю работу: не возникает ситуации
+  «снапшот говорит, что сделано, а форма на Диске старая» (случаи 12-13.11).
+  Этапов стало 6; при неуспешной записи формы снапшот не загружается.
+
 v2.6 (06.11.2026) — режим из аргументов обрезается от пробелов
   ("fill " из поля ручного запуска больше не валит прогон с argparse-error).
 v2.5 (06.11.2026) — 404 при скачивании снапшота не ретраится
@@ -315,7 +322,7 @@ def run_mode(mode, monday, workdir):
             if mode == "sync":
                 print("[runner] ОТМЕНА: снапшот недели не найден на Диске. Сначала fill.")
                 return "failed"
-    print("[runner] Этап 1/5: скачивание формы")
+    print("[runner] Этап 1/6: скачивание формы")
     data, modified = retry_call(disk_download, "скачивание формы")
     with open(src, "wb") as f:
         f.write(data)
@@ -324,7 +331,7 @@ def run_mode(mode, monday, workdir):
            "--monday", monday, "--src", src, "--out", out]
     if mode in ("fill", "sync"):
         cmd += ["--state", state]
-    print("[runner] Этап 2/5: ЗАПУСК:", " ".join(cmd))
+    print("[runner] Этап 2/6: ЗАПУСК:", " ".join(cmd))
     rc = subprocess.call(cmd)
     if rc == 3:
         print("[runner] ШТАТНАЯ ОТМЕНА (защита данных): условия не подходят для этой операции. "
@@ -334,23 +341,20 @@ def run_mode(mode, monday, workdir):
         print(f"[runner] Режим {mode} завершился с кодом {rc} — на Диск ничего не загружено")
         return "failed"
 
-    print("[runner] Этап 3/5: загрузка снапшота")
-    if mode in ("fill", "sync") and os.path.exists(state):
-        if not retry_call(lambda: state_upload(state), "загрузка снапшота"):
-            raise RuntimeError("снапшот не загружен на Диск")
+    print("[runner] Этап 3/6: сверка нового файла со скачанным")
     with open(out, "rb") as f:
         new_data = f.read()
     if new_data == data:
         print("[runner] Файл не изменился — загрузка на Диск не нужна")
         return "nochange"
-    print("[runner] Этап 4/5: проверка, что форму не правили во время работы")
+    print("[runner] Этап 4/6: проверка, что форму не правили во время работы")
     if modified is not None:
         current = retry_call(lambda: disk_info()[1], "метаданные формы")
         if current != modified:
             print("[runner] ОТМЕНА ЗАГРУЗКИ: форму редактировали во время работы робота. "
                   "Ничего не перезаписано — запустите ещё раз позже.")
             return "failed"
-    print("[runner] Этап 5/5: загрузка формы")
+    print("[runner] Этап 5/6: загрузка формы")
     ok = disk_upload(new_data, data)
     if ok and mode == "prep":
         # Prep затёр таблицу — снапшот недели устарел и блокирует следующий fill.
@@ -358,7 +362,18 @@ def run_mode(mode, monday, workdir):
             print("[runner] prep загрузил форму, но снапшот не удалён — "
                   "прогон помечен как упавший, чтобы обратить внимание")
             return "failed"
-    return "uploaded" if ok else "failed"
+    if not ok:
+        # Форма не записана (лок/ошибка) — снапшот не трогаем: он останется
+        # в состоянии до операции, и повторный прогон всё повторит сам.
+        return "failed"
+    print("[runner] Этап 6/6: загрузка снапшота (после формы: при сбое записи "
+          "формы снапшот не обновляется и повтор безопасен)")
+    if mode in ("fill", "sync") and os.path.exists(state):
+        if not retry_call(lambda: state_upload(state), "загрузка снапшота"):
+            raise RuntimeError("форма загружена, но снапшот не загружен — "
+                               "запустите прогон ещё раз: повтор безопасен, "
+                               "дубли не появятся (sync сверяет по ячейкам)")
+    return "uploaded"
 
 
 def main():
