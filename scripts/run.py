@@ -3,6 +3,23 @@
 """Раннер: скачивает форму с Диска, запускает tool.py в нужном режиме,
 загружает результат и снапшот обратно.
 
+v2.9 (13.11.2026) — третья защита prep: сверка ДАТЫ НЕДЕЛИ в самой форме.
+  Даже если снапшота нет (сбои предыдущих прогонов), но шапка таблицы уже
+  показывает понедельник целевой недели — форма заполнена этим fill'ом и/или
+  вручную, и prep её затёр бы. Теперь runner читает строку дат формы и
+  пропускает такой prep штатно (зелёный, без изменений). Если дату разобрать
+  не удалось — prep выполняется как раньше (форма формата tool.py разбирается
+  всегда; нестандартная шапка = ручная правка).
+
+v2.8 (13.11.2026) — защита от запоздавших кронов (случай 12.11: запоздалый prep
+  затёр заполненную неделю вместе с ручными правками):
+  * prep и fill выполняются только в четверг (UTC): запоздавший крон, пришедший
+    в другой день, пропускается штатно (зелёный прогон без изменений);
+  * prep пропускается, если на Диске уже есть снапшот этой недели (неделя
+    заполнена fill'ом) — вместо стирания ячеек;
+  * ручной запуск с FORCE=1 (галочка force в workflow_dispatch) обходит
+    обе защиты, когда prep/fill действительно нужен вне расписания.
+
 v2.7 (13.11.2026) — снапшот загружается ПОСЛЕ успешной записи формы и
   только если форма записалась. При сбое записи (файл залочен в редакторе,
   форму правили во время работы) снапшот остаётся в прежнем состоянии и
@@ -37,6 +54,7 @@ v2.3 (05.11.2026) — v2.2 + штатная отмена не помечаетс
 import argparse
 import hashlib
 import json
+import re
 import os
 import subprocess
 import sys
@@ -310,8 +328,54 @@ def state_delete(tries=3, delay=10):
     return False
 
 
+RU_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+             "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12}
+
+
+def form_week_monday(path):
+    """Понедельник из строки дат формы (row 0, col 0: '16 ноября') или None.
+
+    Год в шапке не пишется — сравниваем (день, месяц)."""
+    try:
+        from docx import Document
+        doc = Document(path)
+        if not doc.tables:
+            return None
+        txt = doc.tables[0].rows[0].cells[0].text.strip()
+        m = re.match(r"^(\d{1,2})\s+([а-яё]+)", txt)
+        if not m:
+            return None
+        mon = RU_MONTHS.get(m.group(2))
+        if mon is None:
+            return None
+        return (int(m.group(1)), mon)
+    except Exception:
+        return None
+
+
 def run_mode(mode, monday, workdir):
     """Вернуть статус: 'uploaded' | 'nochange' | 'failed'."""
+    force = os.environ.get("FORCE", "").strip().lower() in ("1", "true", "yes")
+    now_utc = datetime.now(timezone.utc)
+    # Защита от запоздавших кронов: prep и fill — только в четверг (UTC).
+    # sync можно в любой день: он идемпотентен. Ручной запуск с force обходит.
+    if not force and mode in ("prep", "fill") and now_utc.weekday() != 3:
+        print(f"[runner] ШТАТНАЯ ОТМЕНА: {mode} пришёл с запозданием — сегодня не четверг. "
+              "Данные не тронуты, прогон завершён без изменений")
+        return "skipped"
+    if not force and mode == "prep":
+        st = state_download(monday, workdir)
+        if st is not None:
+            try:
+                with open(st, encoding="utf-8") as _f:
+                    _w = json.load(_f).get("week")
+            except Exception:
+                _w = None
+            if _w == monday:
+                print("[runner] ШТАТНАЯ ОТМЕНА: неделя уже заполнена (снапшот на Диске). "
+                      "prep пропущен, чтобы не затереть заполненные ячейки и ручные правки. "
+                      "Если prep действительно нужен — запустите вручную с force")
+                return "skipped"
     src = os.path.join(workdir, "form_current.docx")
     out = os.path.join(workdir, "form_new.docx")
     state = None
@@ -326,6 +390,16 @@ def run_mode(mode, monday, workdir):
     data, modified = retry_call(disk_download, "скачивание формы")
     with open(src, "wb") as f:
         f.write(data)
+
+    if not force and mode == "prep":
+        wm = form_week_monday(src)
+        md = datetime.strptime(monday, "%Y-%m-%d").date()
+        if wm is not None and wm == (md.day, md.month):
+            print("[runner] ШТАТНАЯ ОТМЕНА: форма уже показывает неделю с " + monday +
+                  " — она заполнена (fill и/или вручную). prep пропущен, чтобы не затереть "
+                  "заполненные ячейки и ручные правки. Если prep действительно нужен — "
+                  "запустите вручную с force")
+            return "skipped"
 
     cmd = [sys.executable, os.path.join(HERE, "tool.py"), mode,
            "--monday", monday, "--src", src, "--out", out]
