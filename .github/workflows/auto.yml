@@ -17,6 +17,11 @@ on:
         description: "prep | fill | sync"
         required: false
         default: "sync"
+      force:
+        description: "Обойти защиты prep/fill (только если понимаете зачем)"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   auto:
@@ -38,6 +43,7 @@ jobs:
           FORM_PATH: ${{ secrets.FORM_PATH }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
           SECTIONS: ${{ secrets.SECTIONS }}
+          FORCE: ${{ inputs.force }}
           GOVERNORS: ${{ secrets.GOVERNORS }}
           GOV_MARKER: ${{ secrets.GOV_MARKER }}
           YC_API_KEY: ${{ secrets.YC_API_KEY }}
